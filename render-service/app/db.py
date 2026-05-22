@@ -51,19 +51,30 @@ async def aexec(query: str, params: tuple = (), fetch: str = "none") -> Any:
 # ------------------ Candidates ------------------
 async def get_candidate(candidate_id: int) -> Optional[dict]:
     return await aexec(
-        "SELECT id, reddit_id, subreddit, author, title, selftext, score,"
-        " num_comments, status, permalink"
-        " FROM reddit_candidates WHERE id = %s",
+        "SELECT id, source, external_id, author, title, selftext, language,"
+        " theme, setting, tone, status, permalink, score, num_comments"
+        " FROM story_candidates WHERE id = %s",
         (candidate_id,), fetch="one",
     )
 
 
-async def pick_next_queued(limit: int = 1) -> list[dict]:
+async def pick_next_queued(limit: int = 1, language: Optional[str] = None) -> list[dict]:
+    if language:
+        return await aexec(
+            "SELECT id, source, external_id, title, selftext, author,"
+            " language, theme, setting, tone, score, num_comments"
+            " FROM story_candidates"
+            " WHERE status = 'queued' AND language = %s"
+            " ORDER BY quality_score DESC NULLS LAST, fetched_at ASC"
+            " LIMIT %s",
+            (language, limit), fetch="all",
+        ) or []
     return await aexec(
-        "SELECT id, reddit_id, title, selftext, author, score, num_comments"
-        " FROM reddit_candidates"
+        "SELECT id, source, external_id, title, selftext, author,"
+        " language, theme, setting, tone, score, num_comments"
+        " FROM story_candidates"
         " WHERE status = 'queued'"
-        " ORDER BY quality_score DESC NULLS LAST, score DESC"
+        " ORDER BY quality_score DESC NULLS LAST, fetched_at ASC"
         " LIMIT %s",
         (limit,), fetch="all",
     ) or []
@@ -72,11 +83,56 @@ async def pick_next_queued(limit: int = 1) -> list[dict]:
 async def mark_candidate_status(candidate_id: int, status: str,
                                 error: Optional[str] = None) -> None:
     await aexec(
-        "UPDATE reddit_candidates SET status = %s,"
+        "UPDATE story_candidates SET status = %s,"
         " rejection_reason = COALESCE(%s, rejection_reason)"
         " WHERE id = %s",
         (status, error, candidate_id),
     )
+
+
+async def insert_ai_candidate(
+    title: str, selftext: str, selftext_hash: str,
+    language: str, theme: str, setting: str, tone: str,
+    word_count: int, quality_score: float, horror_score: float,
+    self_assessment: Optional[str], status: str,
+    gen_model: str, gen_cost_usd: float,
+    external_id: Optional[str] = None,
+) -> int:
+    row = await aexec(
+        "INSERT INTO story_candidates (source, external_id, author, title,"
+        " selftext, selftext_hash, language, theme, setting, tone, word_count,"
+        " quality_score, horror_score, self_assessment, status,"
+        " gen_model, gen_cost_usd)"
+        " VALUES ('ai_generated', %s, 'AI', %s, %s, %s, %s, %s, %s, %s, %s,"
+        "         %s, %s, %s, %s, %s, %s)"
+        " ON CONFLICT (source, external_id) DO UPDATE"
+        "   SET title = EXCLUDED.title"
+        " RETURNING id",
+        (external_id, title, selftext, selftext_hash, language,
+         theme, setting, tone, word_count,
+         quality_score, horror_score, self_assessment, status,
+         gen_model, gen_cost_usd),
+        fetch="one",
+    )
+    return row["id"]
+
+
+async def stories_generated_today(language: Optional[str] = None) -> int:
+    if language:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM story_candidates"
+            " WHERE source = 'ai_generated' AND language = %s"
+            "   AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            (language,), fetch="one",
+        )
+    else:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM story_candidates"
+            " WHERE source = 'ai_generated'"
+            "   AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            fetch="one",
+        )
+    return int(row["n"]) if row else 0
 
 
 # ------------------ Scripts ------------------

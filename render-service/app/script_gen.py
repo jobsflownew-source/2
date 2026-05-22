@@ -38,11 +38,10 @@ Reglas estrictas:
 - El image_prompt es descriptivo, cinematografico, vertical 9:16, sin texto."""
 
 
-USER_TEMPLATE = """Adapta esta historia de r/{subreddit} a un YouTube Short narrado en {language_label}.
+USER_TEMPLATE = """Adapta esta historia a un YouTube Short narrado en {language_label}.
 
 TITULO ORIGINAL: {title}
-AUTOR: u/{author}
-HISTORIA:
+{source_line}HISTORIA:
 {story}
 
 Devuelve EXACTAMENTE este JSON:
@@ -66,8 +65,7 @@ Devuelve EXACTAMENTE este JSON:
 Reglas adicionales:
 - Genera entre 3 y 5 segmentos. Total entre 120 y 240 segundos.
 - El primer segmento ES el hook expandido a narracion.
-- Calcula estimated_duration_sec asumiendo {wpm} palabras por minuto.
-- Atribuye al autor en seo_description: "Story by u/{author}".
+- Calcula estimated_duration_sec asumiendo {wpm} palabras por minuto.{attribution_rule}
 - Si la historia es inadaptable (muy confusa, sin trama, demasiado corta), devuelve {{"reject": true, "reason": "..."}} en lugar del JSON normal."""
 
 
@@ -93,10 +91,22 @@ def _build_user_prompt(candidate: dict, language: str) -> str:
     story = candidate["selftext"]
     if len(story) > 6000:
         story = story[:6000] + "\n\n[...resto truncado...]"
+
+    source = candidate.get("source", "ai_generated")
+    if source == "reddit":
+        source_line = f"AUTOR: u/{candidate.get('author', 'anonymous')}\n"
+        attribution_rule = (
+            f"\n- Atribuye al autor en seo_description: "
+            f"\"Story by u/{candidate.get('author', 'anonymous')}\"."
+        )
+    else:
+        source_line = ""
+        attribution_rule = ""
+
     return USER_TEMPLATE.format(
-        subreddit=candidate.get("subreddit", "nosleep"),
         title=candidate["title"],
-        author=candidate.get("author", "anonymous"),
+        source_line=source_line,
+        attribution_rule=attribution_rule,
         story=story,
         language_label=LANGUAGE_LABELS.get(language, "espanol"),
         wpm=LANGUAGE_WPM.get(language, 145),

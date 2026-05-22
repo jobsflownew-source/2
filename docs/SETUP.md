@@ -1,4 +1,4 @@
-# Setup Guide — Horror Shorts MVP
+# Setup Guide — Horror Shorts MVP (100% AI)
 
 Guia completa para desplegar el MVP en un VPS Hetzner CX22 (~$8/mes) o
 en local para desarrollo.
@@ -9,7 +9,7 @@ en local para desarrollo.
 - 4 vCPU / 8 GB RAM minimo (para render de video).
 - Docker + docker compose v2.
 - 30 GB de disco (assets generados se acumulan).
-- Acceso a las APIs externas (ver [Cuentas necesarias](#2-cuentas-y-credenciales-necesarias)).
+- Acceso a las APIs externas (ver siguiente seccion).
 
 ```bash
 # Instalar Docker en Ubuntu
@@ -20,48 +20,39 @@ sudo usermod -aG docker $USER
 
 ## 2. Cuentas y credenciales necesarias
 
-### Reddit (gratis)
-1. Ve a https://www.reddit.com/prefs/apps
-2. **Create App** → tipo **script** → redirect URI: `http://localhost:8080`
-3. Copia `client_id` (debajo del nombre) y `client_secret`
-4. En `.env`:
-   - `REDDIT_CLIENT_ID`
-   - `REDDIT_CLIENT_SECRET`
-   - `REDDIT_USERNAME`, `REDDIT_PASSWORD` (de tu cuenta)
-
-### OpenAI (~$5/mes para 150 shorts)
+### OpenAI (REQUERIDO, ~$5/mes para 150 shorts)
 1. https://platform.openai.com/api-keys → crear key
-2. Anade $5 de credito prepagado
-3. `OPENAI_API_KEY=sk-...`
+2. **Settings → Billing**: anade $5 de credito prepagado
+3. `.env`: `OPENAI_API_KEY=sk-...`
 
-### Azure Speech (gratis 500k chars/mes — opcional)
-1. Crea cuenta gratis en https://portal.azure.com
-2. **Create resource** → **Speech** → tier `F0` (free)
-3. Copia `KEY 1` y la `Region`
-4. `.env`: `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION`
-5. **Si no tienes Azure**, el sistema usa Edge-TTS automaticamente (gratis tambien).
-
-### Stock images (todas gratis)
+### Stock images (todas gratis, OPCIONALES — el sistema funciona con cualquiera)
 - **Pixabay**: https://pixabay.com/api/docs/ → `PIXABAY_API_KEY`
 - **Unsplash**: https://unsplash.com/developers → `UNSPLASH_ACCESS_KEY`
 - **Pexels**: https://www.pexels.com/api/ → `PEXELS_API_KEY`
 
-### YouTube Data API v3
-1. Google Cloud Console → crear proyecto
-2. Habilita **YouTube Data API v3**
-3. **Credentials** → **OAuth 2.0 Client ID** → tipo `Desktop`
-4. Descarga JSON, ejecuta script de obtener refresh token (ver `scripts/youtube_oauth.py`, no incluido en MVP)
-5. `.env`: `YOUTUBE_CLIENT_ID`, `YOUTUBE_CLIENT_SECRET`, `YOUTUBE_REFRESH_TOKEN`
+> Recomendado: configura **al menos una** (Pixabay es la mas rapida de obtener).
 
-### Discord (webhooks)
-1. En tu servidor: **Server Settings** → **Integrations** → **Webhooks** → **New Webhook**
+### Azure Speech (gratis 500k chars/mes — OPCIONAL)
+1. Cuenta gratis en https://portal.azure.com
+2. **Create resource** → **Speech** → tier `F0` (free)
+3. Copia `KEY 1` y la `Region`
+4. `.env`: `AZURE_SPEECH_KEY`, `AZURE_SPEECH_REGION`
+
+> **Si no tienes Azure**, el sistema usa **Edge-TTS** automaticamente (gratis tambien).
+
+### Discord (webhooks — OPCIONAL pero recomendado)
+1. En tu servidor Discord: **Server Settings** → **Integrations** → **Webhooks** → **New Webhook**
 2. Copia URL → `DISCORD_WEBHOOK_URL`
+
+### YouTube Data API v3 (futuro WF4 — no necesario para MVP actual)
+Skip por ahora. Lo configuraremos cuando construyamos WF4_Publish.
 
 ## 3. Arranque rapido
 
 ```bash
-git clone <repo-url>
-cd 2
+git clone https://github.com/<tu-org>/<tu-repo>.git horror
+cd horror
+git checkout feat/ai-story-generation
 chmod +x scripts/bootstrap.sh
 ./scripts/bootstrap.sh
 ```
@@ -72,7 +63,7 @@ El script:
 3. `docker compose up -d`.
 4. Imprime credenciales generadas.
 
-Edita `.env` para anadir las claves de APIs externas:
+Edita `.env` para anadir las claves API:
 
 ```bash
 nano .env
@@ -81,85 +72,108 @@ docker compose restart
 
 ## 4. Importar workflows en n8n
 
-1. Abre `http://<TU_IP>:5678` (login con `admin` / la pass que imprimio bootstrap).
-2. **Settings** → **Credentials** → **Add credential**:
+1. Abre `http://<TU_IP>:5678` (login `admin` / pass que imprimio bootstrap).
+2. **Settings (rueda) → Credentials → Add credential**:
    - **Postgres** llamada `Postgres app`:
      - Host: `postgres`, Port: `5432`
-     - Database: el de `POSTGRES_DB` (`horror_shorts`)
+     - Database: `horror_shorts`
      - User/Password: los de `.env`
-     - Schema: `app`
-   - **HTTP Basic Auth** llamada `Reddit Basic Auth (client_id:client_secret)`:
-     - User: `REDDIT_CLIENT_ID`
-     - Password: `REDDIT_CLIENT_SECRET`
+     - SSL: `disable`
 3. **Workflows** → **Import from file**:
-   - `n8n/workflows/WF1_Ingestion.json`
-   - `n8n/workflows/WF2_Curation.json`
+   - `n8n/workflows/WF1_AIStoryGen.json`
    - `n8n/workflows/WF3_Production.json`
-4. Activa cada workflow (toggle arriba a la derecha).
-5. Ejecuta manualmente WF1 una vez (boton **Execute Workflow**) para verificar.
+4. Para cada workflow importado: click en los nodos Postgres y selecciona la credencial `Postgres app`.
+5. Activa cada workflow (toggle "Active" arriba derecha).
 
 ## 5. Verificar funcionamiento
 
+### 5.1 Salud del API
 ```bash
-# Render-service health
 curl http://localhost:8000/health
-
-# Probar TTS (sin claves externas)
-chmod +x scripts/test_render.sh
-./scripts/test_render.sh
-
-# Ver candidates ingestados
-docker compose exec postgres psql -U horror -d horror_shorts -c \
-  "SELECT id, title, score, num_comments, status FROM app.reddit_candidates ORDER BY id DESC LIMIT 10;"
+# {"status":"ok","version":"0.1.0"}
 ```
 
-## 6. Cron y mantenimiento
+### 5.2 Smoke test TTS + stock images (sin coste)
+```bash
+chmod +x scripts/test_render.sh
+./scripts/test_render.sh
+```
 
-Los workflows traen sus propios crons. Para mantenimiento adicional:
+### 5.3 Generar la primera historia con IA (~$0.02)
+Desde n8n: **Execute Workflow** en `WF1_AIStoryGen`. O directamente con curl:
+```bash
+KEY=$(grep '^RENDER_API_KEY=' .env | cut -d= -f2)
+curl -X POST http://localhost:8000/stories/generate \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"count": 1, "language": "es", "auto_queue": true}' | jq
+```
+
+Verifica en DB:
+```bash
+docker compose exec postgres psql -U horror -d horror_shorts -c \
+  "SELECT id, source, title, theme, setting, quality_score, status FROM app.story_candidates ORDER BY id DESC LIMIT 5;"
+```
+
+### 5.4 Producir el primer short (1-3 min)
+```bash
+chmod +x scripts/test_produce.sh
+./scripts/test_produce.sh
+```
+
+Te imprimira la URL del MP4 final. Abrela en el navegador.
+
+## 6. Configuracion fina
+
+Todo se ajusta en la tabla `policy_params`:
 
 ```bash
-# Limpiar assets antiguos (opcional, guardalo en cron)
-0 3 * * * docker exec horror_postgres psql -U horror -d horror_shorts -c \
-  "DELETE FROM app.reddit_candidates WHERE status='rejected' AND fetched_at < now() - INTERVAL '30 days';"
+# Cambiar idioma por defecto
+docker compose exec postgres psql -U horror -d horror_shorts -c \
+  "UPDATE app.policy_params SET value='\"en\"'::jsonb WHERE key='default_language';"
+
+# Aumentar a 8 historias/dia
+docker compose exec postgres psql -U horror -d horror_shorts -c \
+  "UPDATE app.policy_params SET value='8'::jsonb WHERE key='stories_per_day';"
+
+# Bajar produccion a 3 shorts/dia
+docker compose exec postgres psql -U horror -d horror_shorts -c \
+  "UPDATE app.policy_params SET value='3'::jsonb WHERE key='max_shorts_per_day';"
+
+# Anadir un theme nuevo
+docker compose exec postgres psql -U horror -d horror_shorts -c \
+  "UPDATE app.policy_params SET value=value || '[\"objeto familiar que aparece donde no debe\"]'::jsonb WHERE key='story_themes';"
 ```
 
 ## 7. Costes reales esperados (MVP)
 
-Despues del primer mes (datos reales aproximados):
-
 | Servicio | Uso | Coste |
 |---|---|---|
 | VPS Hetzner CX22 | 4 vCPU, 8 GB | $8 |
-| Storage (MinIO local en VPS) | ~30 GB | $0 |
-| Reddit API | 200 req/dia | $0 |
-| OpenAI gpt-4o-mini | ~10 candidates/dia × 4k tokens | $4-6 |
-| Edge-TTS | Ilimitado | $0 |
-| Pixabay/Unsplash/Pexels | <1000 req/dia | $0 |
+| Storage MinIO local | ~30 GB | $0 |
+| OpenAI gpt-4o-mini | ~150 stories+scripts/mes | $4-6 |
+| Edge-TTS / Azure free | Ilimitado / 500k chars | $0 |
+| Pixabay / Unsplash / Pexels | <1000 req/dia | $0 |
 | Discord webhooks | Ilimitados | $0 |
 | **TOTAL** | | **~$12-14/mes** |
 
-> Si activas Azure TTS: gratis hasta 500k chars/mes (~250 shorts).
-> Si superas el free tier: $4/1M chars con Azure Neural.
+## 8. Limites del MVP actual
 
-## 8. Limites del MVP
+**Funciona end-to-end:**
+- ✅ Generacion de historias originales con IA (WF1)
+- ✅ Adaptacion a guion segmentado para Shorts
+- ✅ TTS + busqueda de imagenes stock
+- ✅ Render MP4 9:16 con Ken Burns + subtitulos quemados
+- ✅ Almacenamiento de assets y video final en MinIO
+- ✅ Tracking completo de costes en `cost_ledger`
 
-Este MVP **NO** incluye todavia (planificado para fases siguientes):
-
-- WF4 subida a YouTube
-- WF5 analytics
-- WF6 optimizer (multi-armed bandit)
-- WF7 respuesta a comentarios
-- WF8 multi-idioma
-- Generacion de miniaturas
-- Generacion de imagenes IA (usa solo stock)
-
-Lo que SI funciona end-to-end con este MVP:
-- Ingesta de candidatos desde Reddit (WF1)
-- Scoring y filtrado con GPT (WF2)
-- **Produccion completa de Shorts (WF3): guion -> TTS -> imagenes -> MP4 9:16**
-- TTS funcional (Edge-TTS gratis)
-- Busqueda de imagenes stock con fallback entre 3 proveedores
-- Render con Ken Burns + subtitulos ASS quemados
+**Pendiente (proximos sprints):**
+- WF4 subida automatica a YouTube
+- WF5 analytics + recoleccion de metricas
+- WF6 optimizer (multi-armed bandit para voces, themes, horarios)
+- WF7 respuesta a comentarios con IA
+- WF8 multi-idioma (traduccion + redoblaje)
+- Generacion de imagenes IA propias (Stable Diffusion)
+- Miniaturas custom
 
 ## 9. Troubleshooting
 
@@ -169,26 +183,26 @@ chmod 644 db/init.sql
 docker compose down -v && docker compose up -d
 ```
 
-### n8n no encuentra el schema `app`
-- Ejecuta el SQL manualmente:
-```bash
-docker compose exec -T postgres psql -U horror -d horror_shorts < db/init.sql
-```
+### `WF1_AIStoryGen` falla con "OPENAI_API_KEY no configurada"
+- Verifica `.env`: `OPENAI_API_KEY=sk-...`
+- `docker compose restart render-service`
 
-### Edge-TTS falla con 403
-- Es un servicio no oficial de Microsoft. Si bloquean tu IP, configura
-  Azure Speech (free tier) o usa una VPN para desarrollo.
+### Edge-TTS falla con 403 (raro pero pasa)
+- Microsoft puede bloquear IPs de datacenters. Configura Azure (free tier).
 
 ### Render falla por OOM
-- Sube el VPS a CCX13 (8 GB → 16 GB) durante renders intensos, o
-  limita a 1 render concurrente con un Redis lock.
+- Sube el VPS a CCX13 (8 → 16 GB), o limita a 1 produccion concurrente.
+
+### Las historias se sienten repetitivas
+- Anade mas themes/settings a `policy_params` (ver seccion 6).
+- Sube `temperature` editando `story_gen.py` linea ~115 (default 0.85).
 
 ## 10. Roadmap
 
-Ver issues del repo. Proximos hitos:
 - Sprint 1: WF4 publicacion en YouTube + miniaturas
-- Sprint 2: WF5 analytics + WF6 optimizer (multi-armed bandit)
+- Sprint 2: WF5 analytics + WF6 optimizer
 - Sprint 3: WF7 comentarios + WF8 multi-idioma
+- Sprint 4: imagenes IA propias (Stable Diffusion via RunPod)
 
 ## 11. API endpoints del render-service (referencia)
 
@@ -200,16 +214,26 @@ Todos requieren header `X-API-Key: $RENDER_API_KEY`.
 | GET | `/tts/voices?language=es` | Lista voces Edge-TTS |
 | POST | `/tts` | Sintetiza un texto, devuelve URL del MP3 |
 | POST | `/images/search` | Busca imagen stock por keywords |
-| POST | `/render` | Renderiza un short con segments ya preparados |
-| **POST** | **`/script`** | **Genera (o reusa) guion JSON desde candidate_id** |
-| **POST** | **`/produce`** | **Pipeline completo candidate -> MP4 (timeout 10min)** |
+| POST | `/render` | Renderiza un short con segments preparados |
+| POST | `/script` | Genera (o reusa) guion JSON desde candidate_id |
+| POST | `/produce` | Pipeline completo candidate -> MP4 (timeout 10min) |
 | GET | `/produce/queue?limit=10` | Lista candidatos `queued` pendientes |
 | GET | `/produce/today?language=es` | Cuantos shorts producidos hoy |
+| **POST** | **`/stories/generate`** | **Genera N historias IA originales** |
+| GET | `/stories/today?language=es` | Cuantas historias generadas hoy |
 
-Ejemplo de produccion manual:
+Ejemplo de flujo manual completo:
 ```bash
+KEY=$(grep '^RENDER_API_KEY=' .env | cut -d= -f2)
+
+# 1. Genera 1 historia
+RESP=$(curl -sX POST http://localhost:8000/stories/generate \
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d '{"count": 1, "language": "es"}')
+CID=$(echo $RESP | jq -r '.candidates[0].candidate_id')
+
+# 2. Produce el short
 curl -X POST http://localhost:8000/produce \
-  -H "X-API-Key: $RENDER_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"candidate_id": 42, "language": "es"}'
+  -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+  -d "{\"candidate_id\": $CID, \"language\": \"es\"}"
 ```

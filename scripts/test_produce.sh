@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Test end-to-end de WF3: produce un short desde un candidato queued.
-# Requiere: stack levantado, OPENAI_API_KEY en .env, candidato con status='queued' en DB.
+# Test end-to-end: si no hay candidates, genera uno con IA. Despues produce un short.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -18,13 +17,19 @@ QUEUE=$(curl -sf "$API/produce/queue?limit=1" -H "X-API-Key: $KEY")
 echo "$QUEUE" | jq .
 
 CID=$(echo "$QUEUE" | jq -r '.[0].candidate_id // empty')
+
 if [ -z "$CID" ]; then
   echo ""
-  echo "No hay candidatos en estado 'queued'."
-  echo "Ejecuta antes WF1_Ingestion + WF2_Curation, o promueve uno manualmente:"
-  echo "  docker compose exec postgres psql -U horror -d horror_shorts -c \\"
-  echo "    \"UPDATE app.reddit_candidates SET status='queued', quality_score=8, horror_score=8 WHERE id=1;\""
-  exit 1
+  echo "No hay candidatos. Generando una historia con IA..."
+  GEN=$(curl -sf -X POST "$API/stories/generate" \
+    -H "X-API-Key: $KEY" -H "Content-Type: application/json" \
+    -d '{"count": 1, "language": "es", "auto_queue": true}')
+  echo "$GEN" | jq '{created, total_cost_usd, candidates: .candidates | map({candidate_id, title, theme, setting})}'
+  CID=$(echo "$GEN" | jq -r '.candidates[0].candidate_id // empty')
+  if [ -z "$CID" ]; then
+    echo "ERROR: la generacion fallo. Revisa OPENAI_API_KEY en .env."
+    exit 1
+  fi
 fi
 
 echo ""

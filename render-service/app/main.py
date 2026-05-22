@@ -19,6 +19,8 @@ from .pipeline import produce_short
 from .script_gen import generate_script
 from .security import require_api_key
 from .storage import get_storage
+from .story_gen import (DEFAULT_SETTINGS, DEFAULT_THEMES, DEFAULT_TONES,
+                        generate_story)
 from .tts import list_voices, synthesize
 from .video import Segment, get_duration_sec, render_short
 
@@ -338,3 +340,110 @@ async def produce_today(language: Optional[str] = None):
     except (TypeError, ValueError):
         max_n = 5
     return {"language": language, "produced_today": n, "max_per_day": max_n}
+
+
+# ---------- AI Story generation ----------
+class StoryGenRequest(BaseModel):
+    count: int = 1
+    language: str = "es"
+    themes: Optional[list[str]] = None
+    settings_pool: Optional[list[str]] = None
+    tones: Optional[list[str]] = None
+    min_words: int = 1500
+    max_words: int = 2800
+    auto_queue: bool = True   # si True -> status='queued', si False -> 'new'
+
+
+@app.post("/stories/generate", dependencies=[Depends(require_api_key)])
+async def stories_generate(req: StoryGenRequest):
+    """Genera N historias originales con GPT y las inserta en story_candidates."""
+    if req.count < 1 or req.count > 10:
+        raise HTTPException(400, "count must be 1..10")
+
+    # Lee bancos desde policy_params si el request no los provee
+    themes = req.themes
+    if not themes:
+        pol = await db.policy_get("story_themes")
+        themes = pol if isinstance(pol, list) and pol else DEFAULT_THEMES
+    settings_pool = req.settings_pool
+    if not settings_pool:
+        pol = await db.policy_get("story_settings")
+        settings_pool = pol if isinstance(pol, list) and pol else DEFAULT_SETTINGS
+    tones = req.tones
+    if not tones:
+        pol = await db.policy_get("story_tones")
+        tones = pol if isinstance(pol, list) and pol else DEFAULT_TONES
+
+    created = []
+    errors = []
+    status = "queued" if req.auto_queue else "new"
+
+    for i in range(req.count):
+        try:
+            story = await generate_story(
+                language=req.language,
+                themes_pool=themes,
+                settings_pool=settings_pool,
+                tones_pool=tones,
+                min_words=req.min_words,
+                max_words=req.max_words,
+            )
+            meta = story["_meta"]
+            cid = await db.insert_ai_candidate(
+                title=story["title"],
+                selftext=story["story"],
+                selftext_hash=meta["selftext_hash"],
+                language=meta["language"],
+                theme=meta["theme"],
+                setting=meta["setting"],
+                tone=meta["tone"],
+                word_count=meta["word_count"],
+                quality_score=story["self_quality_score"],
+                horror_score=story["self_horror_score"],
+                self_assessment=story.get("self_assessment"),
+                status=status,
+                gen_model=meta["model"],
+                gen_cost_usd=meta["cost_usd"],
+                external_id=meta["selftext_hash"],  # idempotencia por hash
+            )
+            await db.log_cost(
+                service="openai", operation="story_generation",
+                units=meta["tokens_in"] + meta["tokens_out"],
+                cost_usd=meta["cost_usd"],
+                meta={"candidate_id": cid, "model": meta["model"],
+                      "theme": meta["theme"], "setting": meta["setting"]},
+            )
+            created.append({
+                "candidate_id": cid,
+                "title": story["title"],
+                "theme": meta["theme"],
+                "setting": meta["setting"],
+                "tone": meta["tone"],
+                "word_count": meta["word_count"],
+                "self_quality": story["self_quality_score"],
+                "self_horror": story["self_horror_score"],
+                "cost_usd": meta["cost_usd"],
+            })
+        except Exception as e:
+            log.exception("story_gen_failed", index=i, error=str(e))
+            errors.append({"index": i, "error": str(e)})
+
+    return {
+        "requested": req.count,
+        "created": len(created),
+        "candidates": created,
+        "errors": errors,
+        "total_cost_usd": round(sum(c["cost_usd"] for c in created), 5),
+    }
+
+
+@app.get("/stories/today", dependencies=[Depends(require_api_key)])
+async def stories_today(language: Optional[str] = None):
+    """Cuantas historias IA se han generado hoy."""
+    n = await db.stories_generated_today(language=language)
+    target = await db.policy_get("stories_per_day", default=5)
+    try:
+        target = int(target)
+    except (TypeError, ValueError):
+        target = 5
+    return {"language": language, "generated_today": n, "target_per_day": target}

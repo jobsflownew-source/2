@@ -14,52 +14,62 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 -- =====================================================
--- 1. Candidatos extraidos de Reddit
+-- 1. Candidatos de historias (multi-source)
 -- =====================================================
-CREATE TABLE IF NOT EXISTS reddit_candidates (
+-- source = 'ai_generated' (default) | 'reddit' | 'public_domain' | 'manual'
+CREATE TABLE IF NOT EXISTS story_candidates (
     id              SERIAL PRIMARY KEY,
-    reddit_id       TEXT UNIQUE NOT NULL,
-    subreddit       TEXT NOT NULL DEFAULT 'nosleep',
-    author          TEXT,
+    source          TEXT NOT NULL DEFAULT 'ai_generated'
+        CHECK (source IN ('ai_generated','reddit','public_domain','manual')),
+    external_id     TEXT,                  -- id en la fuente externa (reddit_id si aplica)
+    author          TEXT,                  -- 'AI' o el autor real si reddit/public
     title           TEXT NOT NULL,
     selftext        TEXT NOT NULL,
     selftext_hash   CHAR(32) NOT NULL,
     url             TEXT,
     permalink       TEXT,
-    score           INT NOT NULL DEFAULT 0,
-    num_comments    INT NOT NULL DEFAULT 0,
+    -- Metadatos generales
+    language        TEXT NOT NULL DEFAULT 'es',
+    theme           TEXT,                  -- el "tema" usado para generar (IA)
+    setting         TEXT,                  -- el "setting" usado para generar (IA)
+    tone            TEXT,                  -- el tono usado (IA)
+    word_count      INT,
+    -- Reddit-specific (NULL para IA)
+    score           INT,
+    num_comments    INT,
     upvote_ratio    NUMERIC(4,3),
     over_18         BOOLEAN NOT NULL DEFAULT FALSE,
     created_utc     TIMESTAMPTZ,
-    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- Scoring (lo rellena WF2_Curation)
+    -- Scoring
     quality_score   NUMERIC(5,2),
     horror_score    NUMERIC(5,2),
+    self_assessment TEXT,
     rejection_reason TEXT,
-    status          TEXT NOT NULL DEFAULT 'new'
-        CHECK (status IN ('new','scored','queued','produced','rejected','blacklisted'))
+    -- Coste de generacion (solo IA)
+    gen_model       TEXT,
+    gen_cost_usd    NUMERIC(10,5),
+    -- Lifecycle
+    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status          TEXT NOT NULL DEFAULT 'queued'
+        CHECK (status IN ('new','scored','queued','produced','rejected','blacklisted')),
+    UNIQUE (source, external_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_candidates_status_score
-    ON reddit_candidates (status, quality_score DESC NULLS LAST);
+    ON story_candidates (status, quality_score DESC NULLS LAST);
 CREATE INDEX IF NOT EXISTS idx_candidates_fetched
-    ON reddit_candidates (fetched_at DESC);
+    ON story_candidates (fetched_at DESC);
 CREATE INDEX IF NOT EXISTS idx_candidates_hash
-    ON reddit_candidates (selftext_hash);
-
--- Lista negra de autores que no permiten reuso
-CREATE TABLE IF NOT EXISTS reddit_blacklist (
-    author          TEXT PRIMARY KEY,
-    reason          TEXT,
-    added_at        TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+    ON story_candidates (selftext_hash);
+CREATE INDEX IF NOT EXISTS idx_candidates_source
+    ON story_candidates (source, status);
 
 -- =====================================================
 -- 2. Guiones generados por GPT
 -- =====================================================
 CREATE TABLE IF NOT EXISTS scripts (
     id                  SERIAL PRIMARY KEY,
-    candidate_id        INT NOT NULL REFERENCES reddit_candidates(id) ON DELETE CASCADE,
+    candidate_id        INT NOT NULL REFERENCES story_candidates(id) ON DELETE CASCADE,
     language            TEXT NOT NULL DEFAULT 'es',
     title               TEXT NOT NULL,
     seo_description     TEXT,
@@ -215,9 +225,52 @@ INSERT INTO policy_params (key, value) VALUES
     ('image_styles', '["found_footage","cinematic_horror","polaroid_80s","gothic_painting"]'::jsonb),
     ('publish_hours_utc', '[14,18,21]'::jsonb),
     ('max_shorts_per_day', '5'::jsonb),
+    ('stories_per_day', '5'::jsonb),
+    ('default_language', '"es"'::jsonb),
     ('hook_templates', '["Esto le paso a...","Nunca crei en... hasta que","Si ves esto, no..."]'::jsonb),
-    ('min_quality_score', '6.5'::jsonb),
-    ('min_horror_score', '7.0'::jsonb)
+    ('min_quality_score', '6.0'::jsonb),
+    ('min_horror_score', '6.5'::jsonb),
+    ('story_themes', '[
+        "ritual antiguo redescubierto por accidente",
+        "entidad atrapada en un objeto cotidiano",
+        "doble identico que reemplaza al original",
+        "transmision que no deberia existir",
+        "bucle temporal con reglas crueles",
+        "trabajo nocturno con normas que no debes romper",
+        "foto o grabacion que cambia con el tiempo",
+        "vecino o conocido que no es lo que parece",
+        "infancia que regresa con un significado oscuro",
+        "promesa hecha hace anos que se cobra ahora",
+        "juego inocente con consecuencias catastroficas",
+        "presencia que solo aparece a una hora especifica",
+        "regla familiar nunca explicada que ahora entiende",
+        "testigo de algo que el resto no recuerda",
+        "casa que cambia su geometria por la noche"
+    ]'::jsonb),
+    ('story_settings', '[
+        "metro de madrugada vacio",
+        "cabana en el bosque sin senal",
+        "hospital de noche pasillo cerrado",
+        "carretera secundaria entre niebla",
+        "edificio de oficinas piso 13 fuera de horario",
+        "habitacion de hotel de carretera",
+        "sotano de casa familiar",
+        "garaje subterraneo a las 4am",
+        "supermercado 24h sin clientes",
+        "playa abandonada en invierno",
+        "iglesia rural cerrada por restauracion",
+        "camping fuera de temporada",
+        "biblioteca antigua seccion restringida",
+        "estacion de tren rural sin personal",
+        "pueblo de montana desconectado por nieve"
+    ]'::jsonb),
+    ('story_tones', '[
+        "psicologico sutil",
+        "sobrenatural mundano",
+        "creeping dread",
+        "folk horror",
+        "liminal"
+    ]'::jsonb)
 ON CONFLICT (key) DO NOTHING;
 
 -- =====================================================

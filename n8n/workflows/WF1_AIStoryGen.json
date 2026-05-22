@@ -1,0 +1,135 @@
+{
+  "name": "WF1_AIStoryGen",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily",
+      "name": "Daily 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.story_candidates\n  WHERE source = 'ai_generated'\n    AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\ntarget AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='stories_per_day'\n),\nlang AS (\n  SELECT trim(both '\"' from value::text) AS l FROM app.policy_params WHERE key='default_language'\n)\nSELECT\n  GREATEST(COALESCE((SELECT m FROM target), 5) - (SELECT n FROM today_count), 0) AS to_generate,\n  COALESCE((SELECT l FROM lang), 'es') AS language,\n  (SELECT n FROM today_count) AS generated_today,\n  COALESCE((SELECT m FROM target), 5) AS target_per_day;"
+      },
+      "id": "check-quota",
+      "name": "Check daily quota",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "needed",
+              "leftValue": "={{ $json.to_generate }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-needed",
+      "name": "Need to generate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://render-service:8000/stories/generate",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-API-Key", "value": "={{ $env.RENDER_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"count\": {{ $json.to_generate }},\n  \"language\": \"{{ $json.language }}\",\n  \"auto_queue\": true\n}",
+        "options": {
+          "timeout": 600000,
+          "retry": {
+            "enabled": true,
+            "maxRetries": 1,
+            "waitBetweenTries": 15000
+          }
+        }
+      },
+      "id": "call-generate",
+      "name": "Generate stories",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 historias IA generadas\",\n    \"description\": \"**Creadas:** {{ $json.created }}/{{ $json.requested }}\\n**Coste total:** ${{ $json.total_cost_usd }}\",\n    \"fields\": [\n      {\"name\": \"Errores\", \"value\": \"{{ ($json.errors || []).length }}\", \"inline\": true}\n    ],\n    \"color\": 5814783\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-ok",
+      "name": "Discord OK",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 cuota diaria alcanzada\",\n    \"description\": \"Generadas hoy: **{{ $json.generated_today }}/{{ $json.target_per_day }}**\",\n    \"color\": 16776960\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-skip",
+      "name": "Discord skip",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 400]
+    }
+  ],
+  "connections": {
+    "Daily 06:00": {"main": [[{"node": "Check daily quota", "type": "main", "index": 0}]]},
+    "Check daily quota": {"main": [[{"node": "Need to generate?", "type": "main", "index": 0}]]},
+    "Need to generate?": {
+      "main": [
+        [{"node": "Generate stories", "type": "main", "index": 0}],
+        [{"node": "Discord skip", "type": "main", "index": 0}]
+      ]
+    },
+    "Generate stories": {"main": [[{"node": "Discord OK", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "tags": [{"name": "horror-shorts"}, {"name": "ai-generation"}]
+}
