@@ -1,0 +1,159 @@
+{
+  "name": "WF2_Curation_GPT",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 7 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily",
+      "name": "Daily 07:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, reddit_id, title, selftext, score, num_comments, author\nFROM app.reddit_candidates\nWHERE status = 'new'\n  AND author NOT IN (SELECT author FROM app.reddit_blacklist WHERE author IS NOT NULL)\nORDER BY score DESC\nLIMIT 10;"
+      },
+      "id": "fetch-new",
+      "name": "Fetch new candidates",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "Authorization", "value": "=Bearer {{ $env.OPENAI_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $env.OPENAI_MODEL_CHEAP || 'gpt-4o-mini' }}\",\n  \"temperature\": 0.3,\n  \"response_format\": {\"type\": \"json_object\"},\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"Eres un evaluador de historias de terror para YouTube Shorts. Devuelves SOLO JSON valido.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Evalua esta historia y devuelve JSON:\\n{\\n  \\\"horror_score\\\": 0-10 (que tan terrorifica/atmosférica es),\\n  \\\"quality_score\\\": 0-10 (narrativa, originalidad, hook),\\n  \\\"shorts_potential\\\": 0-10 (adaptable a shorts virales),\\n  \\\"estimated_segments\\\": 1-8,\\n  \\\"main_themes\\\": [hasta 5 temas en ingles para imagenes],\\n  \\\"reject_reason\\\": null o motivo,\\n  \\\"summary_es\\\": \\\"resumen en 2 frases (espanol)\\\"\\n}\\n\\nTITULO: {{ $json.title }}\\nTEXTO: {{ $json.selftext.substring(0, 4000) }}\"\n    }\n  ]\n}",
+        "options": {
+          "timeout": 60000,
+          "retry": {
+            "enabled": true,
+            "maxRetries": 2,
+            "waitBetweenTries": 3000
+          }
+        }
+      },
+      "id": "gpt-score",
+      "name": "GPT scoring",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combina datos del candidato con la respuesta de GPT\nconst out = [];\nconst inputs = $input.all();\nconst originals = $('Fetch new candidates').all();\nfor (let i = 0; i < inputs.length; i++) {\n  const cand = originals[i].json;\n  const gptRaw = inputs[i].json;\n  let scoring = {};\n  try {\n    const content = gptRaw.choices[0].message.content;\n    scoring = JSON.parse(content);\n  } catch (e) {\n    scoring = {reject_reason: 'gpt_parse_error', horror_score: 0, quality_score: 0};\n  }\n  // Coste estimado (gpt-4o-mini): $0.15/1M in, $0.60/1M out (approx)\n  const usage = gptRaw.usage || {};\n  const cost = ((usage.prompt_tokens || 0) * 0.15 / 1e6) + ((usage.completion_tokens || 0) * 0.60 / 1e6);\n  out.push({json: {\n    candidate_id: cand.id,\n    reddit_id: cand.reddit_id,\n    horror_score: scoring.horror_score || 0,\n    quality_score: scoring.quality_score || 0,\n    shorts_potential: scoring.shorts_potential || 0,\n    estimated_segments: scoring.estimated_segments || 4,\n    main_themes: scoring.main_themes || [],\n    summary_es: scoring.summary_es || '',\n    reject_reason: scoring.reject_reason,\n    llm_cost_usd: Number(cost.toFixed(5)),\n    llm_tokens_in: usage.prompt_tokens || 0,\n    llm_tokens_out: usage.completion_tokens || 0,\n  }});\n}\nreturn out;"
+      },
+      "id": "merge-scoring",
+      "name": "Merge scoring",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH thresholds AS (\n  SELECT\n    (value->>0)::numeric AS min_quality\n  FROM app.policy_params WHERE key='min_quality_score'\n),\nhthresh AS (\n  SELECT (value->>0)::numeric AS min_horror\n  FROM app.policy_params WHERE key='min_horror_score'\n)\nUPDATE app.reddit_candidates c\nSET\n  quality_score = $2::numeric,\n  horror_score = $3::numeric,\n  rejection_reason = $4,\n  status = CASE\n    WHEN $4 IS NOT NULL THEN 'rejected'\n    WHEN $2::numeric >= COALESCE((SELECT min_quality FROM thresholds), 6.5)\n      AND $3::numeric >= COALESCE((SELECT min_horror FROM hthresh), 7.0)\n    THEN 'queued'\n    ELSE 'scored'\n  END\nWHERE id = $1::int\nRETURNING id, status;",
+        "options": {
+          "queryReplacement": "={{ $json.candidate_id }},{{ $json.quality_score }},{{ $json.horror_score }},{{ $json.reject_reason }}"
+        }
+      },
+      "id": "update-candidate",
+      "name": "Update candidate status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1120, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO app.cost_ledger (service, operation, units, cost_usd, meta)\nVALUES ('openai', 'curation_score', $1::numeric, $2::numeric, $3::jsonb)\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $('Merge scoring').item.json.llm_tokens_in + $('Merge scoring').item.json.llm_tokens_out }},{{ $('Merge scoring').item.json.llm_cost_usd }},{{ JSON.stringify({candidate_id: $('Merge scoring').item.json.candidate_id, tokens_in: $('Merge scoring').item.json.llm_tokens_in, tokens_out: $('Merge scoring').item.json.llm_tokens_out}) }}"
+        }
+      },
+      "id": "log-cost",
+      "name": "Log cost",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1340, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  COUNT(*) FILTER (WHERE status='queued') AS queued,\n  COUNT(*) FILTER (WHERE status='rejected') AS rejected,\n  COUNT(*) FILTER (WHERE status='scored') AS scored,\n  COALESCE(SUM(cost_usd) FILTER (WHERE service='openai' AND occurred_at >= now() - INTERVAL '1 day'), 0) AS daily_cost_usd\nFROM app.reddit_candidates c\nLEFT JOIN app.cost_ledger l ON l.occurred_at >= now() - INTERVAL '1 day';"
+      },
+      "id": "summary",
+      "name": "Summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1560, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "bodyContentType": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF2 Curation completada\",\n    \"fields\": [\n      {\"name\": \"Queued\", \"value\": \"{{ $json.queued }}\", \"inline\": true},\n      {\"name\": \"Rejected\", \"value\": \"{{ $json.rejected }}\", \"inline\": true},\n      {\"name\": \"Scored (no top)\", \"value\": \"{{ $json.scored }}\", \"inline\": true},\n      {\"name\": \"Coste GPT 24h\", \"value\": \"${{ $json.daily_cost_usd }}\", \"inline\": false}\n    ],\n    \"color\": 15158332\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-notify",
+      "name": "Discord notify",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Daily 07:00": {"main": [[{"node": "Fetch new candidates", "type": "main", "index": 0}]]},
+    "Fetch new candidates": {"main": [[{"node": "GPT scoring", "type": "main", "index": 0}]]},
+    "GPT scoring": {"main": [[{"node": "Merge scoring", "type": "main", "index": 0}]]},
+    "Merge scoring": {"main": [[{"node": "Update candidate status", "type": "main", "index": 0}]]},
+    "Update candidate status": {"main": [[{"node": "Log cost", "type": "main", "index": 0}]]},
+    "Log cost": {"main": [[{"node": "Summary", "type": "main", "index": 0}]]},
+    "Summary": {"main": [[{"node": "Discord notify", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "tags": [{"name": "horror-shorts"}, {"name": "curation"}]
+}
