@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     # Workspace
     workspace_dir: str = "/workspace"
 
+    # OpenAI (para guion)
+    openai_api_key: str = ""
+    openai_model_cheap: str = "gpt-4o-mini"
+    openai_model_premium: str = "gpt-4o"
+
     # TTS
     azure_speech_key: str = ""
     azure_speech_region: str = "westeurope"

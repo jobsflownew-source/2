@@ -21,7 +21,7 @@ Sistema 100% automático para generar YouTube Shorts de historias de terror desd
 |---|---|
 | `WF1_Ingestion` | Reddit → DB de candidatos (cada 6h) |
 | `WF2_Curation` | Score con GPT → cola "to-produce" (diario) |
-| `WF3_Production` | Guion → TTS → Imágenes → Video |
+| `WF3_Production` | Guion → TTS → Imágenes → MP4 (cada 4h) |
 | `WF4_Publish` | Sube a YouTube + notifica Discord |
 | `WF5_Analytics` | Recoge métricas (cada 12h) |
 

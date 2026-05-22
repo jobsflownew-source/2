@@ -94,6 +94,7 @@ docker compose restart
 3. **Workflows** → **Import from file**:
    - `n8n/workflows/WF1_Ingestion.json`
    - `n8n/workflows/WF2_Curation.json`
+   - `n8n/workflows/WF3_Production.json`
 4. Activa cada workflow (toggle arriba a la derecha).
 5. Ejecuta manualmente WF1 una vez (boton **Execute Workflow**) para verificar.
 
@@ -144,7 +145,6 @@ Despues del primer mes (datos reales aproximados):
 
 Este MVP **NO** incluye todavia (planificado para fases siguientes):
 
-- WF3 produccion completa (guion → audio → imagenes → render)
 - WF4 subida a YouTube
 - WF5 analytics
 - WF6 optimizer (multi-armed bandit)
@@ -156,9 +156,10 @@ Este MVP **NO** incluye todavia (planificado para fases siguientes):
 Lo que SI funciona end-to-end con este MVP:
 - Ingesta de candidatos desde Reddit (WF1)
 - Scoring y filtrado con GPT (WF2)
+- **Produccion completa de Shorts (WF3): guion -> TTS -> imagenes -> MP4 9:16**
 - TTS funcional (Edge-TTS gratis)
-- Busqueda de imagenes stock
-- Render manual de un short via API `/render`
+- Busqueda de imagenes stock con fallback entre 3 proveedores
+- Render con Ken Burns + subtitulos ASS quemados
 
 ## 9. Troubleshooting
 
@@ -185,6 +186,30 @@ docker compose exec -T postgres psql -U horror -d horror_shorts < db/init.sql
 ## 10. Roadmap
 
 Ver issues del repo. Proximos hitos:
-- Sprint 1: WF3 produccion (este es el grande)
-- Sprint 2: WF4 publicacion en YouTube
-- Sprint 3: WF5 analytics + WF6 optimizer
+- Sprint 1: WF4 publicacion en YouTube + miniaturas
+- Sprint 2: WF5 analytics + WF6 optimizer (multi-armed bandit)
+- Sprint 3: WF7 comentarios + WF8 multi-idioma
+
+## 11. API endpoints del render-service (referencia)
+
+Todos requieren header `X-API-Key: $RENDER_API_KEY`.
+
+| Metodo | Path | Descripcion |
+|---|---|---|
+| GET | `/health` | Healthcheck |
+| GET | `/tts/voices?language=es` | Lista voces Edge-TTS |
+| POST | `/tts` | Sintetiza un texto, devuelve URL del MP3 |
+| POST | `/images/search` | Busca imagen stock por keywords |
+| POST | `/render` | Renderiza un short con segments ya preparados |
+| **POST** | **`/script`** | **Genera (o reusa) guion JSON desde candidate_id** |
+| **POST** | **`/produce`** | **Pipeline completo candidate -> MP4 (timeout 10min)** |
+| GET | `/produce/queue?limit=10` | Lista candidatos `queued` pendientes |
+| GET | `/produce/today?language=es` | Cuantos shorts producidos hoy |
+
+Ejemplo de produccion manual:
+```bash
+curl -X POST http://localhost:8000/produce \
+  -H "X-API-Key: $RENDER_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"candidate_id": 42, "language": "es"}'
+```

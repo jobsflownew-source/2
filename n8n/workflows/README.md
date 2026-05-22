@@ -41,8 +41,21 @@
 - Promueve a `queued` los que superan los thresholds en `policy_params`.
 - Registra coste en `cost_ledger`.
 
+### `WF3_Production.json`
+- Trigger: cron cada 4 horas.
+- Toma el siguiente candidato `queued` con mayor `quality_score`.
+- Comprueba el limite diario (`policy_params.max_shorts_per_day`).
+- Llama a `render-service:8000/produce`:
+  1. Genera guion con GPT (cache si ya existe en `scripts`).
+  2. Genera TTS por segmento (Edge-TTS gratis).
+  3. Busca imagen stock por keywords (Pixabay/Unsplash/Pexels).
+  4. Renderiza MP4 9:16 con Ken Burns + subs ASS.
+  5. Sube a MinIO y crea row en `shorts` con `status='rendered'`.
+- Notifica a Discord con el video final o con el motivo de skip.
+
+> Timeout del nodo HTTP: **600000 ms (10 min)** para tolerar renders pesados.
+
 ## Proximos workflows (no incluidos en este MVP, ver SETUP.md)
 
-- `WF3_Production`: guion completo + TTS + imagenes + render.
 - `WF4_Publish`: subida a YouTube.
 - `WF5_Analytics`: recoleccion de metricas.

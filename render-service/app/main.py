@@ -12,8 +12,11 @@ import structlog
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from . import db
 from .config import settings
 from .images import download_image, find_best_image
+from .pipeline import produce_short
+from .script_gen import generate_script
 from .security import require_api_key
 from .storage import get_storage
 from .tts import list_voices, synthesize
@@ -197,3 +200,141 @@ async def render(req: RenderRequest):
         duration_sec=duration,
         file_size_bytes=size,
     )
+
+
+# ---------- Script generation (GPT) ----------
+class ScriptRequest(BaseModel):
+    candidate_id: int
+    language: str = "es"
+    force_regenerate: bool = False
+
+
+@app.post("/script", dependencies=[Depends(require_api_key)])
+async def script_endpoint(req: ScriptRequest):
+    """Genera (o devuelve cacheado) el guion JSON estructurado para un candidato."""
+    candidate = await db.get_candidate(req.candidate_id)
+    if not candidate:
+        raise HTTPException(404, f"Candidate {req.candidate_id} not found")
+
+    if not req.force_regenerate:
+        existing = await db.get_script(req.candidate_id, req.language)
+        if existing:
+            return {
+                "script_id": existing["id"],
+                "candidate_id": req.candidate_id,
+                "language": req.language,
+                "title": existing["title"],
+                "seo_description": existing["seo_description"],
+                "tags": existing["tags"],
+                "hook": existing["hook"],
+                "segments": existing["segments"],
+                "total_estimated_sec": float(existing["total_estimated_sec"] or 0),
+                "llm_cost_usd": float(existing["llm_cost_usd"] or 0),
+                "cached": True,
+            }
+
+    try:
+        parsed = await generate_script(candidate, language=req.language)
+    except Exception as e:
+        log.exception("script_gen_failed", error=str(e))
+        raise HTTPException(500, f"Script generation failed: {e}")
+
+    meta = parsed.pop("_meta", {})
+    script_id = await db.insert_script(
+        candidate_id=req.candidate_id, language=req.language,
+        title=parsed["title"], seo_description=parsed["seo_description"],
+        tags=parsed["tags"], hook=parsed["hook"],
+        segments=parsed["segments"],
+        total_estimated_sec=parsed.get("total_estimated_sec", 0),
+        llm_model=meta.get("model", ""),
+        tokens_in=meta.get("tokens_in", 0),
+        tokens_out=meta.get("tokens_out", 0),
+        cost_usd=meta.get("cost_usd", 0),
+    )
+    await db.log_cost(
+        service="openai", operation="script_generation",
+        units=meta.get("tokens_in", 0) + meta.get("tokens_out", 0),
+        cost_usd=meta.get("cost_usd", 0),
+        script_id=script_id,
+        meta={"model": meta.get("model"), "candidate_id": req.candidate_id},
+    )
+    return {
+        "script_id": script_id,
+        "candidate_id": req.candidate_id,
+        "language": req.language,
+        "title": parsed["title"],
+        "seo_description": parsed["seo_description"],
+        "tags": parsed["tags"],
+        "hook": parsed["hook"],
+        "segments": parsed["segments"],
+        "total_estimated_sec": parsed.get("total_estimated_sec", 0),
+        "llm_cost_usd": meta.get("cost_usd", 0),
+        "cached": False,
+    }
+
+
+# ---------- Produce full short ----------
+class ProduceRequest(BaseModel):
+    candidate_id: int
+    language: str = "es"
+    voice: Optional[str] = None
+    force_regenerate_script: bool = False
+    burn_subtitles: bool = True
+    music_url: Optional[str] = None
+
+
+@app.post("/produce", dependencies=[Depends(require_api_key)])
+async def produce_endpoint(req: ProduceRequest):
+    """Pipeline completo: candidato -> guion -> assets -> MP4 final.
+
+    Tarda ~1-3 min por short en VPS basico. Asegurate de que el cliente
+    (n8n) tenga timeout >= 300000 ms.
+    """
+    # Limite diario configurable (policy_params)
+    max_per_day = await db.policy_get("max_shorts_per_day", default=5)
+    try:
+        max_n = int(max_per_day) if not isinstance(max_per_day, int) else max_per_day
+    except (TypeError, ValueError):
+        max_n = 5
+    today = await db.shorts_published_today(language=req.language)
+    if today >= max_n:
+        raise HTTPException(
+            429,
+            f"Daily limit reached ({today}/{max_n}) for language={req.language}",
+        )
+
+    try:
+        result = await produce_short(
+            candidate_id=req.candidate_id,
+            language=req.language,
+            voice=req.voice,
+            force_regenerate_script=req.force_regenerate_script,
+            burn_subtitles=req.burn_subtitles,
+            music_url=req.music_url,
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        log.exception("produce_failed", candidate_id=req.candidate_id, error=str(e))
+        raise HTTPException(500, f"Production failed: {e}")
+
+    return result
+
+
+# ---------- Inspeccion / utilidades ----------
+@app.get("/produce/queue", dependencies=[Depends(require_api_key)])
+async def produce_queue(limit: int = 10):
+    """Devuelve los siguientes candidatos en estado 'queued'."""
+    return await db.pick_next_queued(limit=limit)
+
+
+@app.get("/produce/today", dependencies=[Depends(require_api_key)])
+async def produce_today(language: Optional[str] = None):
+    """Cuantos shorts se han producido hoy (por idioma o total)."""
+    n = await db.shorts_published_today(language=language)
+    max_n = await db.policy_get("max_shorts_per_day", default=5)
+    try:
+        max_n = int(max_n)
+    except (TypeError, ValueError):
+        max_n = 5
+    return {"language": language, "produced_today": n, "max_per_day": max_n}
