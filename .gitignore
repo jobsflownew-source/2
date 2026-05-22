@@ -1,0 +1,46 @@
+# Env
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Docker volumes (locales)
+data/
+postgres-data/
+n8n-data/
+minio-data/
+storage/
+
+# Generated assets
+*.mp4
+*.mp3
+*.wav
+*.png
+*.jpg
+!docs/**/*.png
+!docs/**/*.jpg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+logs/
