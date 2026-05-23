@@ -19,6 +19,11 @@ boto3==1.35.36
 # DB
 psycopg[binary]==3.2.3
 psycopg-pool==3.2.3
+# YouTube Data API
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.151.0
 # Observabilidad
 structlog==24.4.0
 # Utils

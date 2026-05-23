@@ -1,0 +1,153 @@
+{
+  "name": "WF4_Publish",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 6
+            }
+          ]
+        }
+      },
+      "id": "cron-trigger",
+      "name": "Cron 6h",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH today_uploads AS (\n  SELECT COUNT(*) AS n\n  FROM app.shorts\n  WHERE status = 'published'\n    AND published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\nmax_uploads AS (\n  SELECT COALESCE((value::text)::int, 5) AS m\n  FROM app.policy_params WHERE key='max_uploads_per_day'\n)\nSELECT\n  s.id AS short_id,\n  s.title,\n  s.language,\n  s.duration_sec,\n  s.file_size_bytes,\n  (SELECT n FROM today_uploads) AS uploaded_today,\n  COALESCE((SELECT m FROM max_uploads), 5) AS max_per_day,\n  GREATEST(COALESCE((SELECT m FROM max_uploads), 5) - (SELECT n FROM today_uploads), 0) AS remaining\nFROM app.shorts s\nWHERE s.status = 'rendered'\nORDER BY s.created_at ASC\nLIMIT 1;"
+      },
+      "id": "pick-rendered",
+      "name": "Pick next rendered",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [460, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "has-short",
+              "leftValue": "={{ $json.short_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "number",
+                "operation": "exists",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "remaining",
+              "leftValue": "={{ $json.remaining }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "if-can-publish",
+      "name": "Can publish?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://render-service:8000/publish",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-API-Key", "value": "={{ $env.RENDER_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"short_id\": {{ $json.short_id }}\n}",
+        "options": {
+          "timeout": 600000,
+          "retry": {
+            "enabled": true,
+            "maxRetries": 1,
+            "waitBetweenTries": 30000
+          }
+        }
+      },
+      "id": "call-publish",
+      "name": "Upload to YouTube",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF4 Short publicado en YouTube\",\n    \"description\": \"**{{ $json.title }}**\",\n    \"fields\": [\n      {\"name\": \"Short ID\", \"value\": \"{{ $json.short_id }}\", \"inline\": true},\n      {\"name\": \"YouTube ID\", \"value\": \"{{ $json.youtube_video_id }}\", \"inline\": true},\n      {\"name\": \"Duracion\", \"value\": \"{{ $json.duration_sec }}s\", \"inline\": true},\n      {\"name\": \"URL\", \"value\": \"{{ $json.youtube_url }}\"}\n    ],\n    \"color\": 16711680\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-success",
+      "name": "Discord OK",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1120, 200],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF4 sin trabajo o limite alcanzado\",\n    \"description\": \"Subidos hoy: **{{ $json.uploaded_today || 0 }}/{{ $json.max_per_day || 5 }}**\\nProximo intento: en 6h\",\n    \"color\": 16776960\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-skip",
+      "name": "Discord skip",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 400],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Cron 6h": {"main": [[{"node": "Pick next rendered", "type": "main", "index": 0}]]},
+    "Pick next rendered": {"main": [[{"node": "Can publish?", "type": "main", "index": 0}]]},
+    "Can publish?": {
+      "main": [
+        [{"node": "Upload to YouTube", "type": "main", "index": 0}],
+        [{"node": "Discord skip", "type": "main", "index": 0}]
+      ]
+    },
+    "Upload to YouTube": {"main": [[{"node": "Discord OK", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "tags": [{"name": "horror-shorts"}, {"name": "publish"}, {"name": "youtube"}]
+}

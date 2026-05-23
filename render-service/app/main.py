@@ -447,3 +447,120 @@ async def stories_today(language: Optional[str] = None):
     except (TypeError, ValueError):
         target = 5
     return {"language": language, "generated_today": n, "target_per_day": target}
+
+
+
+
+# ---------- YouTube publishing (WF4) ----------
+class PublishRequest(BaseModel):
+    short_id: int
+    privacy: Optional[str] = None        # public | unlisted | private
+    category_id: Optional[str] = None
+
+
+@app.post("/publish", dependencies=[Depends(require_api_key)])
+async def publish_endpoint(req: PublishRequest):
+    """Sube un Short rendered a YouTube via Data API v3.
+
+    Tarda 30-90s segun tamano. Usa cuota YouTube: 1 upload = 1.600 units
+    sobre 10.000/dia gratis = ~6 uploads/dia por proyecto GCP por defecto.
+    """
+    short = await db.get_short(req.short_id)
+    if not short:
+        raise HTTPException(404, f"Short {req.short_id} not found")
+
+    if short["status"] == "published" and short.get("youtube_video_id"):
+        return {
+            "short_id": req.short_id,
+            "youtube_video_id": short["youtube_video_id"],
+            "youtube_url": f"https://youtube.com/shorts/{short['youtube_video_id']}",
+            "status": "already_published",
+        }
+
+    if short["status"] not in ("rendered", "uploading"):
+        raise HTTPException(
+            409,
+            f"Short {req.short_id} status={short['status']} not uploadable",
+        )
+
+    # Lazy import para no requerir libs Google al arrancar si no se usa
+    try:
+        from .youtube import upload_video
+    except ImportError as e:
+        raise HTTPException(500, f"YouTube libs not installed: {e}")
+
+    # Marcar uploading (con error_message=NULL para limpiar reintentos)
+    await db.update_short_status(req.short_id, "uploading")
+
+    # Descargar el MP4 desde MinIO a workspace local
+    work = WORKSPACE / "publish" / str(req.short_id)
+    work.mkdir(parents=True, exist_ok=True)
+    local_mp4 = work / "final.mp4"
+
+    try:
+        # final_video_url apunta a minio:9000/... -> reemplazamos por endpoint interno
+        url = short["final_video_url"]
+        if "minio:9000" not in url and "/horror-assets/" in url:
+            # url ya esta en formato relativo aceptable
+            pass
+        # Descargar con httpx (la URL apunta a minio:9000 desde la red Docker)
+        await _download(url, local_mp4)
+
+        result = await upload_video(
+            local_mp4,
+            title=short["title"] or "",
+            description=short["description"] or "",
+            tags=short["tags"] or [],
+            privacy=req.privacy,
+            category_id=req.category_id,
+        )
+
+        yt_id = result.get("id")
+        if not yt_id:
+            raise RuntimeError(f"YouTube no devolvio id: {result}")
+
+        # status -> published
+        await db.set_short_youtube(
+            req.short_id,
+            youtube_video_id=yt_id,
+            channel_id=result.get("snippet", {}).get("channelId"),
+        )
+        await db.log_cost(
+            service="youtube", operation="video_upload",
+            units=1600, cost_usd=0,   # gratis dentro de quota diaria
+            short_id=req.short_id,
+            meta={"video_id": yt_id, "privacy": req.privacy or "public"},
+        )
+
+        return {
+            "short_id": req.short_id,
+            "youtube_video_id": yt_id,
+            "youtube_url": f"https://youtube.com/shorts/{yt_id}",
+            "status": "published",
+            "duration_sec": float(short["duration_sec"] or 0),
+            "title": short["title"],
+        }
+
+    except Exception as e:
+        log.exception("publish_failed", short_id=req.short_id, error=str(e))
+        # revertir status a rendered (no perder el MP4)
+        await db.update_short_status(req.short_id, "rendered", error=str(e))
+        raise HTTPException(500, f"Publish failed: {e}")
+
+
+@app.get("/publish/queue", dependencies=[Depends(require_api_key)])
+async def publish_queue(limit: int = 10, language: Optional[str] = None):
+    """Lista shorts con status='rendered' listos para subir."""
+    return await db.pick_next_rendered(limit=limit, language=language)
+
+
+@app.get("/publish/today", dependencies=[Depends(require_api_key)])
+async def publish_today(language: Optional[str] = None):
+    """Cuantos shorts publicados hoy y limite del policy."""
+    n = await db.shorts_uploaded_today(language=language)
+    max_n = await db.policy_get("max_uploads_per_day", default=5)
+    try:
+        max_n = int(max_n)
+    except (TypeError, ValueError):
+        max_n = 5
+    return {"language": language, "uploaded_today": n, "max_per_day": max_n}

@@ -223,6 +223,72 @@ async def update_short_status(short_id: int, status: str,
     )
 
 
+async def get_short(short_id: int) -> Optional[dict]:
+    return await aexec(
+        "SELECT id, script_id, language, voice_id, title, description, tags,"
+        " final_video_url, duration_sec, file_size_bytes, status,"
+        " youtube_video_id, channel_id, scheduled_for, published_at,"
+        " error_message, created_at"
+        " FROM shorts WHERE id = %s",
+        (short_id,), fetch="one",
+    )
+
+
+async def pick_next_rendered(limit: int = 1, language: Optional[str] = None) -> list[dict]:
+    """Shorts listos para subir (status='rendered', no subidos aun)."""
+    if language:
+        return await aexec(
+            "SELECT id, script_id, language, title, description, tags,"
+            " final_video_url, duration_sec, file_size_bytes"
+            " FROM shorts"
+            " WHERE status = 'rendered' AND language = %s"
+            " ORDER BY created_at ASC"
+            " LIMIT %s",
+            (language, limit), fetch="all",
+        ) or []
+    return await aexec(
+        "SELECT id, script_id, language, title, description, tags,"
+        " final_video_url, duration_sec, file_size_bytes"
+        " FROM shorts"
+        " WHERE status = 'rendered'"
+        " ORDER BY created_at ASC"
+        " LIMIT %s",
+        (limit,), fetch="all",
+    ) or []
+
+
+async def set_short_youtube(short_id: int, youtube_video_id: str,
+                            channel_id: Optional[str] = None) -> None:
+    """Marca el short como published con su video_id de YouTube."""
+    await aexec(
+        "UPDATE shorts SET status = 'published',"
+        " youtube_video_id = %s,"
+        " channel_id = COALESCE(%s, channel_id),"
+        " published_at = now()"
+        " WHERE id = %s",
+        (youtube_video_id, channel_id, short_id),
+    )
+
+
+async def shorts_uploaded_today(language: Optional[str] = None) -> int:
+    """Cuantos shorts se han subido a YouTube hoy (para respetar quota)."""
+    if language:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE language = %s AND status = 'published'"
+            "   AND published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            (language,), fetch="one",
+        )
+    else:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE status = 'published'"
+            "   AND published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            fetch="one",
+        )
+    return int(row["n"]) if row else 0
+
+
 # ------------------ Cost ledger ------------------
 async def log_cost(service: str, operation: str, units: float,
                    cost_usd: float, script_id: Optional[int] = None,

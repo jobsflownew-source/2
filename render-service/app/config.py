@@ -39,5 +39,13 @@ class Settings(BaseSettings):
     database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
 
+    # YouTube Data API v3
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_refresh_token: str = ""
+    youtube_channel_id: str = ""        # opcional, para verificacion
+    youtube_default_privacy: str = "public"   # public | unlisted | private
+    youtube_default_category_id: str = "24"   # 24 = Entertainment
+
 
 settings = Settings()
