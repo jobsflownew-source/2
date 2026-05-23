@@ -21,7 +21,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.shorts\n  WHERE status IN ('rendered','uploading','published')\n    AND created_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\nmax_day AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='max_shorts_per_day'\n)\nSELECT\n  c.id AS candidate_id,\n  c.title,\n  c.score,\n  c.author,\n  (SELECT n FROM today_count) AS produced_today,\n  COALESCE((SELECT m FROM max_day), 5) AS max_per_day,\n  GREATEST(COALESCE((SELECT m FROM max_day), 5) - (SELECT n FROM today_count), 0) AS remaining\nFROM app.reddit_candidates c\nWHERE c.status = 'queued'\nORDER BY c.quality_score DESC NULLS LAST, c.score DESC\nLIMIT 1;"
+        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.shorts\n  WHERE status IN ('rendered','uploading','published')\n    AND created_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\nmax_day AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='max_shorts_per_day'\n)\nSELECT\n  c.id AS candidate_id,\n  c.title,\n  c.score,\n  c.author,\n  (SELECT n FROM today_count) AS produced_today,\n  COALESCE((SELECT m FROM max_day), 5) AS max_per_day,\n  GREATEST(COALESCE((SELECT m FROM max_day), 5) - (SELECT n FROM today_count), 0) AS remaining\nFROM app.story_candidates c\nWHERE c.status = 'queued'\nORDER BY c.quality_score DESC NULLS LAST, c.fetched_at ASC\nLIMIT 1;"
       },
       "id": "pick-candidate",
       "name": "Pick next queued",
