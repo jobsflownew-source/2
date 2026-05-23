@@ -85,7 +85,7 @@
           ]
         },
         "sendBody": true,
-        "contentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"candidate_id\": {{ $json.candidate_id }},\n  \"language\": \"{{ $env.DEFAULT_LANGUAGE || 'es' }}\",\n  \"burn_subtitles\": true\n}",
         "options": {
           "timeout": 600000,
@@ -107,7 +107,7 @@
         "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF3 Short renderizado\",\n    \"description\": \"**{{ $json.title }}**\\n{{ $json.description }}\",\n    \"fields\": [\n      {\"name\": \"Short ID\", \"value\": \"{{ $json.short_id }}\", \"inline\": true},\n      {\"name\": \"Idioma\", \"value\": \"{{ $json.language }}\", \"inline\": true},\n      {\"name\": \"Duracion\", \"value\": \"{{ $json.duration_sec }}s\", \"inline\": true},\n      {\"name\": \"Segmentos\", \"value\": \"{{ $json.segments_count }}\", \"inline\": true},\n      {\"name\": \"Voz\", \"value\": \"{{ $json.voice }}\", \"inline\": true},\n      {\"name\": \"Tamano\", \"value\": \"{{ Math.round($json.file_size_bytes / 1024 / 1024) }} MB\", \"inline\": true},\n      {\"name\": \"Video\", \"value\": \"{{ $json.video_url }}\"}\n    ],\n    \"color\": 3066993\n  }]\n}",
         "options": {}
       },
@@ -124,7 +124,7 @@
         "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF3 sin trabajo o limite alcanzado\",\n    \"description\": \"Producidos hoy: **{{ $json.produced_today || 0 }}/{{ $json.max_per_day || 5 }}**\\nProximo intento: en 4h\",\n    \"color\": 16776960\n  }]\n}",
         "options": {}
       },

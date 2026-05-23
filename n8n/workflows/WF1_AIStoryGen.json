@@ -74,7 +74,7 @@
           ]
         },
         "sendBody": true,
-        "contentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"count\": {{ $json.to_generate }},\n  \"language\": \"{{ $json.language }}\",\n  \"auto_queue\": true\n}",
         "options": {
           "timeout": 600000,
@@ -96,7 +96,7 @@
         "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 historias IA generadas\",\n    \"description\": \"**Creadas:** {{ $json.created }}/{{ $json.requested }}\\n**Coste total:** ${{ $json.total_cost_usd }}\",\n    \"fields\": [\n      {\"name\": \"Errores\", \"value\": \"{{ ($json.errors || []).length }}\", \"inline\": true}\n    ],\n    \"color\": 5814783\n  }]\n}",
         "options": {}
       },
@@ -113,7 +113,7 @@
         "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 cuota diaria alcanzada\",\n    \"description\": \"Generadas hoy: **{{ $json.generated_today }}/{{ $json.target_per_day }}**\",\n    \"color\": 16776960\n  }]\n}",
         "options": {}
       },
