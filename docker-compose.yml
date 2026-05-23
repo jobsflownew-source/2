@@ -97,6 +97,13 @@ services:
       EXECUTIONS_DATA_MAX_AGE: 168
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      # Permitir uso de $env.X dentro de expresiones de los workflows
+      # (los workflows leen RENDER_API_KEY y DISCORD_WEBHOOK_URL desde aqui)
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # Variables que los workflows necesitan via {{ $env.X }}
+      RENDER_API_KEY: ${RENDER_API_KEY}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-es}
     volumes:
       - n8n_data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
@@ -131,6 +138,12 @@ services:
       MINIO_BUCKET: ${MINIO_BUCKET}
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       REDIS_URL: redis://redis:6379/0
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+      YOUTUBE_REFRESH_TOKEN: ${YOUTUBE_REFRESH_TOKEN:-}
+      YOUTUBE_CHANNEL_ID: ${YOUTUBE_CHANNEL_ID:-}
+      YOUTUBE_DEFAULT_PRIVACY: ${YOUTUBE_DEFAULT_PRIVACY:-public}
+      YOUTUBE_DEFAULT_CATEGORY_ID: ${YOUTUBE_DEFAULT_CATEGORY_ID:-24}
     volumes:
       - render_workspace:/workspace
     depends_on:

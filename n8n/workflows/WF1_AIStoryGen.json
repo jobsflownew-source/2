@@ -40,7 +40,7 @@
         "conditions": {
           "options": {
             "caseSensitive": true,
-            "typeValidation": "strict"
+            "typeValidation": "loose"
           },
           "conditions": [
             {
@@ -64,6 +64,7 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "http://render-service:8000/stories/generate",
         "sendHeaders": true,
         "headerParameters": {
@@ -73,7 +74,7 @@
           ]
         },
         "sendBody": true,
-        "contentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"count\": {{ $json.to_generate }},\n  \"language\": \"{{ $json.language }}\",\n  \"auto_queue\": true\n}",
         "options": {
           "timeout": 600000,
@@ -92,9 +93,10 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 historias IA generadas\",\n    \"description\": \"**Creadas:** {{ $json.created }}/{{ $json.requested }}\\n**Coste total:** ${{ $json.total_cost_usd }}\",\n    \"fields\": [\n      {\"name\": \"Errores\", \"value\": \"{{ ($json.errors || []).length }}\", \"inline\": true}\n    ],\n    \"color\": 5814783\n  }]\n}",
         "options": {}
       },
@@ -102,13 +104,16 @@
       "name": "Discord OK",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1120, 200]
+      "position": [1120, 200],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 cuota diaria alcanzada\",\n    \"description\": \"Generadas hoy: **{{ $json.generated_today }}/{{ $json.target_per_day }}**\",\n    \"color\": 16776960\n  }]\n}",
         "options": {}
       },
@@ -116,7 +121,9 @@
       "name": "Discord skip",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [900, 400]
+      "position": [900, 400],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
     }
   ],
   "connections": {
