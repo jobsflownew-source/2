@@ -75,6 +75,7 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "http://render-service:8000/produce",
         "sendHeaders": true,
         "headerParameters": {
@@ -103,6 +104,7 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
         "bodyContentType": "json",
@@ -119,6 +121,7 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
         "bodyContentType": "json",
