@@ -18,6 +18,7 @@ from PIL import Image
 from . import db
 from .config import settings
 from .images import download_image, find_best_image
+from .images_placeholder import generate_placeholder_image
 from .script_gen import generate_script
 from .storage import get_storage
 from .tts import synthesize
@@ -105,25 +106,47 @@ async def _produce_segment_image(
     segment: dict, work_dir: Path,
     script_id: int, segment_index: int,
 ) -> Path:
+    """Obtiene una imagen para el segmento.
+
+    Cascada de fallbacks:
+    1. find_best_image con las keywords del segmento (Pixabay/Unsplash/Pexels)
+    2. find_best_image con keyword generica segun el mood
+    3. generate_placeholder_image local (gradiente cinematografico) -> JAMAS falla
+    """
     keywords = segment.get("keywords") or []
+    mood = segment.get("mood") or "tension"
+
     image_meta = await find_best_image(keywords)
     if not image_meta:
-        # Fallback: keyword generica del mood
         fallback_kw = {
             "tension": ["dark forest fog"],
             "fear": ["abandoned hallway dim"],
             "despair": ["empty room shadow"],
             "reveal": ["open door darkness"],
             "aftermath": ["broken window night"],
-        }.get(segment.get("mood", ""), ["abandoned house at night"])
+        }.get(mood, ["abandoned house at night"])
         image_meta = await find_best_image(fallback_kw)
-    if not image_meta:
-        raise RuntimeError(f"No image found for segment {segment_index}")
 
     img_path = work_dir / f"img_{segment_index:02d}.jpg"
-    await download_image(image_meta, img_path)
 
-    # Tamano real para meta
+    if image_meta:
+        await download_image(image_meta, img_path)
+        source = image_meta["source"]
+        meta_extra = {
+            "author": image_meta.get("author"),
+            "keywords": keywords[:5],
+        }
+    else:
+        # Sin APIs configuradas o todas fallaron -> placeholder local
+        log.warning(
+            "no_stock_image_found segment=%s mood=%s using_placeholder",
+            segment_index, mood,
+        )
+        seed = f"{script_id}_{segment_index}_{'-'.join(keywords[:3])}"
+        await asyncio.to_thread(generate_placeholder_image, img_path, mood, seed)
+        source = "placeholder"
+        meta_extra = {"keywords": keywords[:5], "mood": mood}
+
     with Image.open(img_path) as im:
         w, h = im.size
 
@@ -132,11 +155,10 @@ async def _produce_segment_image(
     url = storage.upload_file(img_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="image", source=image_meta["source"],
+        asset_type="image", source=source,
         storage_url=url, width=w, height=h,
         file_size_bytes=img_path.stat().st_size,
-        meta={"author": image_meta.get("author"),
-              "keywords": keywords[:5]},
+        meta=meta_extra,
     )
     return img_path
 
