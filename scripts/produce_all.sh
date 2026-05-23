@@ -44,14 +44,28 @@ if [ -z "$QUEUED" ]; then
 fi
 
 TOTAL=$(echo "$QUEUED" | wc -l)
-echo ">>> Vas a producir $TOTAL Short(s)."
-echo ">>> Cada uno tarda 1-3 min (~\$0.005 c/u)."
-echo ">>> Tiempo total estimado: ~$((TOTAL * 2)) min."
-echo ""
-read -r -p "Continuar? (s/N) " RESP
-if [[ ! "$RESP" =~ ^[sSyY]$ ]]; then
-  echo "Cancelado."
-  exit 0
+echo ">>> Vas a producir $TOTAL Short(s) (~\$0.005 c/u, ~$((TOTAL * 2)) min total)."
+
+# Modo no-interactivo si:
+#   - Variable AUTO_YES=1
+#   - Flag --yes o -y como argumento
+#   - No hay tty (ejecutado por cron / n8n)
+AUTO_YES="${AUTO_YES:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --yes|-y) AUTO_YES=1 ;;
+  esac
+done
+if [ ! -t 0 ]; then
+  AUTO_YES=1
+fi
+
+if [ "$AUTO_YES" != "1" ]; then
+  read -r -p "Continuar? (s/N) " RESP
+  if [[ ! "$RESP" =~ ^[sSyY]$ ]]; then
+    echo "Cancelado."
+    exit 0
+  fi
 fi
 
 START_TIME=$(date +%s)
