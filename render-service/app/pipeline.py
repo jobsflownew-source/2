@@ -83,14 +83,16 @@ async def _produce_segment_audio(
         if segment_index > 0
         else f"{segment.get('text','')}"
     )
-    await synthesize(text_for_tts, audio_path, voice=voice, provider="edge")
+    _, _, provider_used = await synthesize(
+        text_for_tts, audio_path, voice=voice, provider="auto"
+    )
     duration = get_duration_sec(audio_path)
     storage = get_storage()
     obj = f"audio/{script_id}/seg_{segment_index:02d}.mp3"
     url = storage.upload_file(audio_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="audio", source="edge_tts",
+        asset_type="audio", source=provider_used,
         storage_url=url,
         duration_ms=int(duration * 1000),
         file_size_bytes=audio_path.stat().st_size,
