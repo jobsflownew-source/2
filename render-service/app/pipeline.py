@@ -182,7 +182,11 @@ async def produce_short(
     )
     log.info("produce script_id=%s segs=%d", script_id, len(script["segments"]))
 
-    voice = voice or settings.tts_default_voice
+    # Selector de voz: si no se pasa explicita, rota desde el banco curado
+    if not voice:
+        voice = await db.pick_next_voice(language=language)
+        await db.record_voice_use(voice)
+        log.info("voice_auto_selected voice=%s script_id=%s", voice, script_id)
     work_dir = WORKSPACE / "produce" / f"script_{script_id}"
     if work_dir.exists():
         shutil.rmtree(work_dir)
