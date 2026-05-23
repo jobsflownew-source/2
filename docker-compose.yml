@@ -97,6 +97,13 @@ services:
       EXECUTIONS_DATA_MAX_AGE: 168
       N8N_DIAGNOSTICS_ENABLED: "false"
       N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      # Permitir uso de $env.X dentro de expresiones de los workflows
+      # (los workflows leen RENDER_API_KEY y DISCORD_WEBHOOK_URL desde aqui)
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+      # Variables que los workflows necesitan via {{ $env.X }}
+      RENDER_API_KEY: ${RENDER_API_KEY}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-es}
     volumes:
       - n8n_data:/home/node/.n8n
       - ./n8n/workflows:/workflows:ro
