@@ -199,15 +199,16 @@ async def insert_short(
     tags: list[str], voice_id: str, image_style: Optional[str],
     final_video_url: str, duration_sec: float,
     file_size_bytes: int, status: str = "rendered",
+    thumbnail_url: Optional[str] = None,
 ) -> int:
     row = await aexec(
         "INSERT INTO shorts (script_id, language, title, description, tags,"
-        "  voice_id, image_style, final_video_url, duration_sec,"
+        "  voice_id, image_style, final_video_url, thumbnail_url, duration_sec,"
         "  file_size_bytes, status)"
-        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
         " RETURNING id",
         (script_id, language, title, description, tags, voice_id, image_style,
-         final_video_url, duration_sec, file_size_bytes, status),
+         final_video_url, thumbnail_url, duration_sec, file_size_bytes, status),
         fetch="one",
     )
     return row["id"]
@@ -226,7 +227,7 @@ async def update_short_status(short_id: int, status: str,
 async def get_short(short_id: int) -> Optional[dict]:
     return await aexec(
         "SELECT id, script_id, language, voice_id, title, description, tags,"
-        " final_video_url, duration_sec, file_size_bytes, status,"
+        " final_video_url, thumbnail_url, duration_sec, file_size_bytes, status,"
         " youtube_video_id, channel_id, scheduled_for, published_at,"
         " error_message, created_at"
         " FROM shorts WHERE id = %s",
@@ -501,3 +502,18 @@ async def tiktok_uploaded_today(language: Optional[str] = None) -> int:
             fetch="one",
         )
     return int(row["n"]) if row else 0
+
+
+
+# ------------------ Thumbnails ------------------
+async def set_short_thumbnail(short_id: int, thumbnail_url: str) -> None:
+    """Actualiza thumbnail_url de un short.
+
+    Se llama tras generar el thumbnail con DALL-E y subirlo a MinIO,
+    antes (o despues) del upload a YouTube. Si el upload a YouTube
+    fallara, el thumbnail queda guardado para reintento posterior.
+    """
+    await aexec(
+        "UPDATE shorts SET thumbnail_url = %s WHERE id = %s",
+        (thumbnail_url, short_id),
+    )

@@ -23,6 +23,7 @@ from .images_placeholder import generate_placeholder_image
 from .image_selection import select_best_image_with_ai
 from .script_gen import generate_script
 from .storage import get_storage
+from .thumbnail_gen import generate_thumbnail
 from .tts import synthesize
 from .video import (DEFAULT_MOOD_COLORS, RenderConfig, Segment,
                     get_duration_sec, render_short)
@@ -428,6 +429,79 @@ async def produce_short(
         file_size_bytes=file_size,
     )
 
+    # 5b. Generar thumbnail con DALL-E (si esta habilitado en policy_params)
+    thumbnail_url: Optional[str] = None
+    thumb_enabled = await db.policy_get("thumbnail_enabled", default=True)
+    if thumb_enabled and settings.openai_api_key:
+        thumb_model = await db.policy_get("thumbnail_model", default="dall-e-3")
+        thumb_quality = await db.policy_get("thumbnail_quality", default="standard")
+        thumb_size = await db.policy_get("thumbnail_size", default="1024x1792")
+        thumb_style = await db.policy_get("thumbnail_style_suffix", default=None)
+        if not isinstance(thumb_model, str):
+            thumb_model = "dall-e-3"
+        if not isinstance(thumb_quality, str):
+            thumb_quality = "standard"
+        if not isinstance(thumb_size, str):
+            thumb_size = "1024x1792"
+        if not isinstance(thumb_style, str) or not thumb_style:
+            thumb_style = None
+
+        thumb_path = work_dir / "thumbnail.jpg"
+        try:
+            thumb_info = await generate_thumbnail(
+                script={
+                    "title": script["title"],
+                    "hook": script.get("hook", ""),
+                    "segments": script["segments"],
+                },
+                out_path=thumb_path,
+                model=thumb_model,
+                quality=thumb_quality,
+                size=thumb_size,
+                style_suffix=thumb_style,
+            )
+        except Exception as e:
+            log.warning("thumbnail_generation_failed err=%s script_id=%s",
+                        e, script_id)
+            thumb_info = None
+
+        if thumb_info and thumb_path.exists():
+            try:
+                thumb_obj = f"thumbnails/{script_id}/thumbnail.jpg"
+                thumbnail_url = storage.upload_file(thumb_path, thumb_obj)
+                await db.insert_asset(
+                    script_id=script_id, segment_index=None,
+                    asset_type="thumbnail", source=thumb_info["model"],
+                    storage_url=thumbnail_url,
+                    width=1080, height=1920,
+                    file_size_bytes=thumb_path.stat().st_size,
+                    cost_usd=thumb_info["cost_usd"],
+                    meta={
+                        "prompt": thumb_info["prompt"],
+                        "revised_prompt": thumb_info.get("revised_prompt"),
+                        "model": thumb_info["model"],
+                        "quality": thumb_info["quality"],
+                        "size": thumb_info["size"],
+                    },
+                )
+                await db.log_cost(
+                    service="openai", operation="thumbnail_generation",
+                    units=1, cost_usd=thumb_info["cost_usd"],
+                    script_id=script_id,
+                    meta={"model": thumb_info["model"],
+                          "quality": thumb_info["quality"]},
+                )
+                log.info("thumbnail_uploaded script_id=%s url=%s cost=$%.3f",
+                         script_id, thumbnail_url[:80],
+                         thumb_info["cost_usd"])
+            except Exception as e:
+                log.warning("thumbnail_upload_failed err=%s script_id=%s",
+                            e, script_id)
+                thumbnail_url = None
+    else:
+        log.info("thumbnail_skipped enabled=%s has_key=%s",
+                 thumb_enabled, bool(settings.openai_api_key))
+
     # 6. Crear short row
     short_id = await db.insert_short(
         script_id=script_id,
@@ -441,6 +515,7 @@ async def produce_short(
         duration_sec=final_duration,
         file_size_bytes=file_size,
         status="rendered",
+        thumbnail_url=thumbnail_url,
     )
 
     # 7. Marcar candidato
@@ -458,6 +533,7 @@ async def produce_short(
         "duration_sec": final_duration,
         "file_size_bytes": file_size,
         "video_url": final_url,
+        "thumbnail_url": thumbnail_url,
         "estimated_total_sec": script.get("total_estimated_sec"),
         "actual_total_sec": round(actual_total, 2),
         "segments_count": len(segments),

@@ -94,8 +94,15 @@ def _upload_sync(
     privacy: str = "public",
     category_id: str = "24",
     made_for_kids: bool = False,
+    thumbnail_path: Optional[Path] = None,
 ) -> dict:
-    """Sube un video con resumable upload. BLOQUEANTE — usa await asyncio.to_thread."""
+    """Sube un video con resumable upload. BLOQUEANTE — usa await asyncio.to_thread.
+
+    Si thumbnail_path se provee, tras el upload exitoso hace
+    videos.thumbnails.set() para sustituir el thumbnail por defecto
+    (primer frame). Coste: ~50 quota units adicionales (despreciable
+    sobre los 1.600 del upload).
+    """
     creds = _get_credentials()
     youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
 
@@ -148,7 +155,34 @@ def _upload_sync(
                 log.info("yt_upload_progress percent=%s", pct)
                 last_progress = pct
 
-    log.info("yt_upload_done video_id=%s", response.get("id"))
+    video_id = response.get("id")
+    log.info("yt_upload_done video_id=%s", video_id)
+
+    # Tras upload exitoso, sustituir el thumbnail si se provee
+    if thumbnail_path and Path(thumbnail_path).exists() and video_id:
+        try:
+            thumb_media = MediaFileUpload(
+                str(thumbnail_path),
+                mimetype="image/jpeg",
+                resumable=False,
+            )
+            youtube.thumbnails().set(
+                videoId=video_id,
+                media_body=thumb_media,
+            ).execute()
+            log.info("yt_thumbnail_set video_id=%s thumb=%s",
+                     video_id, thumbnail_path.name)
+            response["custom_thumbnail_set"] = True
+        except HttpError as e:
+            # No fallar el upload por un thumbnail. Lo log y seguimos.
+            log.warning("yt_thumbnail_set_failed video_id=%s err=%s",
+                        video_id, e)
+            response["custom_thumbnail_set"] = False
+        except Exception as e:
+            log.warning("yt_thumbnail_set_unexpected video_id=%s err=%s",
+                        video_id, e)
+            response["custom_thumbnail_set"] = False
+
     return response
 
 
@@ -159,8 +193,13 @@ async def upload_video(
     tags: list[str],
     privacy: Optional[str] = None,
     category_id: Optional[str] = None,
+    thumbnail_path: Optional[Path | str] = None,
 ) -> dict:
-    """Wrapper async. Devuelve la respuesta de YouTube videos.insert."""
+    """Wrapper async. Devuelve la respuesta de YouTube videos.insert.
+
+    Si thumbnail_path se provee y existe, tras el upload sustituye el
+    thumbnail por defecto via videos.thumbnails.set().
+    """
     return await asyncio.to_thread(
         _upload_sync,
         Path(video_path),
@@ -169,6 +208,7 @@ async def upload_video(
         tags,
         privacy=privacy or settings.youtube_default_privacy,
         category_id=category_id or settings.youtube_default_category_id,
+        thumbnail_path=Path(thumbnail_path) if thumbnail_path else None,
     )
 
 

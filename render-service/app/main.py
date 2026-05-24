@@ -506,6 +506,19 @@ async def publish_endpoint(req: PublishRequest):
         # Descargar con httpx (la URL apunta a minio:9000 desde la red Docker)
         await _download(url, local_mp4)
 
+        # Si el short tiene thumbnail_url custom, descargarlo tambien
+        local_thumb: Optional[Path] = None
+        thumb_url = short.get("thumbnail_url")
+        if thumb_url:
+            local_thumb = work / "thumbnail.jpg"
+            try:
+                await _download(thumb_url, local_thumb)
+                log.info("thumbnail_downloaded for_short=%s", req.short_id)
+            except Exception as e:
+                log.warning("thumbnail_download_failed err=%s short=%s",
+                            e, req.short_id)
+                local_thumb = None
+
         result = await upload_video(
             local_mp4,
             title=short["title"] or "",
@@ -513,6 +526,7 @@ async def publish_endpoint(req: PublishRequest):
             tags=short["tags"] or [],
             privacy=req.privacy,
             category_id=req.category_id,
+            thumbnail_path=local_thumb,
         )
 
         yt_id = result.get("id")
