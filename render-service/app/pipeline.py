@@ -21,6 +21,7 @@ from .config import settings
 from .images import download_image, find_best_image, find_image_candidates
 from .images_placeholder import generate_placeholder_image
 from .image_selection import select_best_image_with_ai
+from .quality_gate import evaluate_short
 from .script_gen import generate_script
 from .storage import get_storage
 from .thumbnail_gen import generate_thumbnail
@@ -521,6 +522,69 @@ async def produce_short(
     # 7. Marcar candidato
     await db.mark_candidate_status(candidate_id, "produced")
 
+    # 8. Quality gate: GPT-4o-mini juzga si el short merece publicarse
+    quality_info: Optional[dict] = None
+    qg_enabled = await db.policy_get("quality_gate_enabled", default=True)
+    if qg_enabled and settings.openai_api_key:
+        qg_min_score_raw = await db.policy_get("quality_gate_min_score", default=6.0)
+        try:
+            qg_min_score = float(qg_min_score_raw)
+        except (TypeError, ValueError):
+            qg_min_score = 6.0
+        qg_model = await db.policy_get("quality_gate_model", default="gpt-4o-mini")
+        if not isinstance(qg_model, str) or not qg_model:
+            qg_model = "gpt-4o-mini"
+        qg_strict = bool(await db.policy_get("quality_gate_strict", default=True))
+
+        try:
+            quality_info = await evaluate_short(
+                title=script["title"],
+                hook=script.get("hook", ""),
+                segments=script["segments"],
+                duration_sec=final_duration,
+                voice=voice,
+                tags=script.get("tags") or [],
+                model=qg_model,
+            )
+        except Exception as e:
+            log.warning("quality_gate_failed err=%s short_id=%s", e, short_id)
+            quality_info = None
+
+        if quality_info:
+            verdict = quality_info["verdict"]
+            score = quality_info["score"]
+            reasoning = quality_info["reasoning"]
+
+            # Decidir si bloqueamos la publicacion
+            should_block = (
+                qg_strict and (
+                    verdict == "reject" or score < qg_min_score
+                )
+            )
+            new_status = "low_quality" if should_block else None
+
+            await db.set_short_quality(
+                short_id, verdict, score, reasoning, new_status=new_status,
+            )
+            await db.log_cost(
+                service="openai", operation="quality_gate",
+                units=quality_info["tokens_in"] + quality_info["tokens_out"],
+                cost_usd=quality_info["cost_usd"],
+                short_id=short_id,
+                meta={"model": quality_info["model"],
+                      "verdict": verdict, "score": score,
+                      "blocked": should_block,
+                      "min_score": qg_min_score},
+            )
+            log.info(
+                "quality_gate_decision short_id=%s verdict=%s score=%.1f "
+                "blocked=%s threshold=%.1f",
+                short_id, verdict, score, should_block, qg_min_score,
+            )
+    else:
+        log.info("quality_gate_skipped enabled=%s has_key=%s",
+                 qg_enabled, bool(settings.openai_api_key))
+
     return {
         "short_id": short_id,
         "script_id": script_id,
@@ -537,4 +601,5 @@ async def produce_short(
         "estimated_total_sec": script.get("total_estimated_sec"),
         "actual_total_sec": round(actual_total, 2),
         "segments_count": len(segments),
+        "quality": quality_info,
     }

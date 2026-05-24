@@ -517,3 +517,38 @@ async def set_short_thumbnail(short_id: int, thumbnail_url: str) -> None:
         "UPDATE shorts SET thumbnail_url = %s WHERE id = %s",
         (thumbnail_url, short_id),
     )
+
+
+
+# ------------------ Quality gate ------------------
+async def set_short_quality(
+    short_id: int,
+    verdict: str,
+    score: float,
+    reasoning: str,
+    new_status: Optional[str] = None,
+) -> None:
+    """Actualiza los campos quality_* de un short y opcionalmente el status.
+
+    Si new_status='low_quality' el short queda fuera de la cola de
+    publicacion (WF4/WF5 buscan status='rendered').
+    """
+    if new_status:
+        await aexec(
+            "UPDATE shorts SET"
+            "  quality_verdict   = %s,"
+            "  quality_score_ai  = %s,"
+            "  quality_reasoning = %s,"
+            "  status            = %s"
+            " WHERE id = %s",
+            (verdict, score, reasoning, new_status, short_id),
+        )
+    else:
+        await aexec(
+            "UPDATE shorts SET"
+            "  quality_verdict   = %s,"
+            "  quality_score_ai  = %s,"
+            "  quality_reasoning = %s"
+            " WHERE id = %s",
+            (verdict, score, reasoning, short_id),
+        )
