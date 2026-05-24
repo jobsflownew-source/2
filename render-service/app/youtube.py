@@ -232,3 +232,52 @@ def _list_recent_uploads_sync(max_results: int) -> list[dict]:
         maxResults=max_results,
     ).execute()
     return pl.get("items") or []
+
+
+def _fetch_stats_sync(video_ids: list[str]) -> list[dict]:
+    """Devuelve statistics para una lista de video_ids (max 50 por call).
+
+    YouTube Data API videos.list cuesta 1 quota unit por llamada (no por
+    video). Como acepta hasta 50 ids comma-separated, trackear 50 shorts
+    al dia cuesta ~1 unit (despreciable sobre 10000/dia).
+
+    Returns lista de dicts:
+      {video_id, views, likes, dislikes, comments, favorites,
+       privacy_status, published_at, duration_iso8601}
+    """
+    if not video_ids:
+        return []
+    creds = _get_credentials()
+    youtube = build("youtube", "v3", credentials=creds, cache_discovery=False)
+
+    out: list[dict] = []
+    # YouTube acepta max 50 ids por llamada
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        resp = youtube.videos().list(
+            part="statistics,status,contentDetails,snippet",
+            id=",".join(batch),
+            maxResults=50,
+        ).execute()
+        for item in resp.get("items") or []:
+            stats = item.get("statistics") or {}
+            status = item.get("status") or {}
+            details = item.get("contentDetails") or {}
+            snippet = item.get("snippet") or {}
+            out.append({
+                "video_id": item.get("id"),
+                "views": int(stats.get("viewCount", 0) or 0),
+                "likes": int(stats.get("likeCount", 0) or 0),
+                "dislikes": int(stats.get("dislikeCount", 0) or 0),
+                "comments": int(stats.get("commentCount", 0) or 0),
+                "favorites": int(stats.get("favoriteCount", 0) or 0),
+                "privacy_status": status.get("privacyStatus"),
+                "published_at": snippet.get("publishedAt"),
+                "duration_iso8601": details.get("duration"),
+            })
+    return out
+
+
+async def fetch_stats(video_ids: list[str]) -> list[dict]:
+    """Wrapper async de _fetch_stats_sync."""
+    return await asyncio.to_thread(_fetch_stats_sync, video_ids)

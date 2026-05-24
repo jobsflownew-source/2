@@ -733,3 +733,91 @@ async def publish_tiktok_today(language: Optional[str] = None):
     except (TypeError, ValueError):
         max_n = 10
     return {"language": language, "uploaded_today": n, "max_per_day": max_n}
+
+
+# ---------- Metrics tracking (WF6) ----------
+class MetricsRefreshRequest(BaseModel):
+    days: int = 30   # ventana de shorts a refrescar (default ultimos 30 dias)
+
+
+@app.post("/metrics/refresh-youtube", dependencies=[Depends(require_api_key)])
+async def metrics_refresh_youtube(req: MetricsRefreshRequest):
+    """Descarga statistics de YouTube Data API y guarda en metrics_hourly.
+
+    Se llama desde WF6 (cron daily). Recoge todos los shorts published
+    de los ultimos req.days, hace fetch_stats en lotes de 50, e inserta
+    una fila por short en metrics_hourly. Refresca la vista materializada.
+
+    Coste YouTube quota: 1 unit por cada 50 shorts. Para 30*10=300 shorts
+    son 6 units (despreciable sobre 10000/dia).
+    """
+    days = max(1, min(req.days, 90))
+    shorts = await db.list_published_shorts(days=days)
+    if not shorts:
+        return {"shorts_tracked": 0, "videos_fetched": 0, "errors": []}
+
+    # Lazy import para no requerir google libs si nadie llama el endpoint
+    try:
+        from .youtube import fetch_stats
+    except ImportError as e:
+        raise HTTPException(500, f"YouTube libs not installed: {e}")
+
+    # Map video_id -> short_id para volver del API result a la DB row
+    vid_to_short: dict[str, int] = {
+        s["youtube_video_id"]: s["id"]
+        for s in shorts if s.get("youtube_video_id")
+    }
+    video_ids = list(vid_to_short.keys())
+
+    try:
+        stats_list = await fetch_stats(video_ids)
+    except Exception as e:
+        log.exception("metrics_refresh_failed", error=str(e))
+        raise HTTPException(500, f"YouTube stats fetch failed: {e}")
+
+    from datetime import datetime, timezone
+    captured = datetime.now(timezone.utc).isoformat()
+
+    inserted = 0
+    errors = []
+    for stat in stats_list:
+        vid = stat.get("video_id")
+        sid = vid_to_short.get(vid)
+        if not sid:
+            continue
+        try:
+            await db.insert_metrics_hourly(
+                short_id=sid,
+                captured_at_iso=captured,
+                views=stat.get("views", 0),
+                likes=stat.get("likes", 0),
+                dislikes=stat.get("dislikes", 0),
+                comments=stat.get("comments", 0),
+            )
+            inserted += 1
+        except Exception as e:
+            log.warning("metrics_insert_failed short_id=%s err=%s", sid, e)
+            errors.append({"short_id": sid, "video_id": vid, "error": str(e)})
+
+    # Refrescar vista materializada (best-effort)
+    try:
+        await db.refresh_performance_view()
+    except Exception as e:
+        log.warning("metrics_view_refresh_failed err=%s", e)
+
+    log.info("metrics_refresh_done shorts=%d fetched=%d inserted=%d errors=%d",
+             len(shorts), len(stats_list), inserted, len(errors))
+
+    return {
+        "shorts_tracked": len(shorts),
+        "videos_fetched": len(stats_list),
+        "rows_inserted": inserted,
+        "errors": errors,
+        "captured_at": captured,
+    }
+
+
+@app.get("/metrics/top", dependencies=[Depends(require_api_key)])
+async def metrics_top(limit: int = 10):
+    """Top shorts por views_per_hour (de la vista materializada)."""
+    return await db.shorts_performance_top(limit=limit)

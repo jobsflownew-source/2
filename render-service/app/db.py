@@ -552,3 +552,81 @@ async def set_short_quality(
             " WHERE id = %s",
             (verdict, score, reasoning, short_id),
         )
+
+
+
+# ------------------ YouTube Analytics tracking ------------------
+async def list_published_shorts(days: int = 30) -> list[dict]:
+    """Devuelve los shorts publicados (status='published' con youtube_video_id)
+    de los ultimos N dias para refrescar sus metricas.
+    """
+    return await aexec(
+        "SELECT id, youtube_video_id, title, language, published_at"
+        " FROM shorts"
+        " WHERE status = 'published'"
+        "   AND youtube_video_id IS NOT NULL"
+        "   AND published_at >= now() - make_interval(days => %s)"
+        " ORDER BY published_at DESC",
+        (days,), fetch="all",
+    ) or []
+
+
+async def insert_metrics_hourly(
+    short_id: int,
+    captured_at_iso: str,
+    views: int = 0, likes: int = 0, dislikes: int = 0,
+    comments: int = 0, shares: int = 0,
+    avg_view_duration_sec: Optional[float] = None,
+    avg_view_percentage: Optional[float] = None,
+    impressions: Optional[int] = None,
+    ctr: Optional[float] = None,
+    subscribers_gained: int = 0,
+    estimated_revenue_usd: float = 0.0,
+) -> None:
+    """Inserta una fila en metrics_hourly. ON CONFLICT actualiza."""
+    await aexec(
+        "INSERT INTO metrics_hourly (short_id, captured_at, views, likes,"
+        "  dislikes, comments, shares, avg_view_duration_sec,"
+        "  avg_view_percentage, impressions, ctr, subscribers_gained,"
+        "  estimated_revenue_usd)"
+        " VALUES (%s, %s::timestamptz, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+        " ON CONFLICT (short_id, captured_at) DO UPDATE"
+        "   SET views    = EXCLUDED.views,"
+        "       likes    = EXCLUDED.likes,"
+        "       dislikes = EXCLUDED.dislikes,"
+        "       comments = EXCLUDED.comments,"
+        "       shares   = EXCLUDED.shares,"
+        "       avg_view_duration_sec = EXCLUDED.avg_view_duration_sec,"
+        "       avg_view_percentage   = EXCLUDED.avg_view_percentage,"
+        "       impressions  = EXCLUDED.impressions,"
+        "       ctr          = EXCLUDED.ctr,"
+        "       subscribers_gained    = EXCLUDED.subscribers_gained,"
+        "       estimated_revenue_usd = EXCLUDED.estimated_revenue_usd",
+        (short_id, captured_at_iso, views, likes, dislikes, comments, shares,
+         avg_view_duration_sec, avg_view_percentage,
+         impressions, ctr, subscribers_gained, estimated_revenue_usd),
+    )
+
+
+async def refresh_performance_view() -> None:
+    """Refresca la vista materializada shorts_performance_24h."""
+    try:
+        await aexec(
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY shorts_performance_24h"
+        )
+    except Exception:
+        # CONCURRENTLY requiere el unique index (que existe), pero por
+        # si acaso falla la primera vez, intentamos sin CONCURRENTLY.
+        await aexec("REFRESH MATERIALIZED VIEW shorts_performance_24h")
+
+
+async def shorts_performance_top(limit: int = 10) -> list[dict]:
+    """Top shorts por views_per_hour de la vista materializada."""
+    return await aexec(
+        "SELECT short_id, youtube_video_id, title, language, published_at,"
+        " hours_since_publish, views, likes, comments, ctr, views_per_hour"
+        " FROM shorts_performance_24h"
+        " ORDER BY views_per_hour DESC NULLS LAST"
+        " LIMIT %s",
+        (limit,), fetch="all",
+    ) or []
