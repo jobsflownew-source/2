@@ -5,7 +5,7 @@ pydantic-settings==2.5.2
 httpx==0.27.2
 python-multipart==0.0.10
 # TTS
-edge-tts==6.1.12
+edge-tts==7.2.8
 azure-cognitiveservices-speech==1.40.0
 # Audio/Video
 moviepy==1.0.3
@@ -19,6 +19,11 @@ boto3==1.35.36
 # DB
 psycopg[binary]==3.2.3
 psycopg-pool==3.2.3
+# YouTube Data API
+google-auth==2.35.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+google-api-python-client==2.151.0
 # Observabilidad
 structlog==24.4.0
 # Utils

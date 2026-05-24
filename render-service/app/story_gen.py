@@ -86,6 +86,7 @@ Reglas estrictas:
 - Estructura: enganche fuerte (3-5 frases), desarrollo creciente, twist o revelacion al final.
 - Sin separadores tipo "---", sin epigrafes, sin numeracion de capitulos.
 - Sin elementos meta tipo "esta es mi historia" o "no se si me creeran".
+- IMPORTANTE: La historia DEBE alcanzar la longitud minima solicitada. Desarrolla escenas, descripciones, monologo interior y dialogos hasta llegar al rango pedido. NUNCA termines antes de la longitud minima.
 - Devuelves SOLO JSON valido, sin markdown ni explicaciones."""
 
 
@@ -95,12 +96,14 @@ Idioma: {language_label}
 Tema central: {theme}
 Setting: {setting}
 Tono: {tone}
-Longitud objetivo: entre {min_words} y {max_words} palabras.
+
+LONGITUD OBLIGATORIA: la historia debe tener entre {min_words} y {max_words} palabras.
+Si te quedas corto, expande con descripcion sensorial, monologo interior, dialogo y construccion de atmosfera. Cuenta las palabras antes de devolver.
 
 Devuelve EXACTAMENTE este JSON:
 {{
   "title": "titulo en {language_label}, max 80 chars, atractivo sin ser clickbait",
-  "story": "historia completa, primera persona, sin titulo dentro del texto, sin separadores, sin epigrafes",
+  "story": "historia completa, primera persona, sin titulo dentro del texto, sin separadores, sin epigrafes. MINIMO {min_words} palabras.",
   "self_quality_score": 1-10 (autocritica honesta de la calidad narrativa),
   "self_horror_score": 1-10 (cuanto miedo o tension genera),
   "self_assessment": "una frase corta de autocritica honesta",
@@ -145,7 +148,7 @@ async def _call_openai(messages: list[dict], model: str,
         "temperature": temperature,
         "response_format": {"type": "json_object"},
         "messages": messages,
-        "max_tokens": 4500,  # historias de hasta ~3000 palabras
+        "max_tokens": 6000,  # historias de hasta ~4000 palabras con margen
     }
     headers = {
         "Authorization": f"Bearer {settings.openai_api_key}",
@@ -161,7 +164,12 @@ async def _call_openai(messages: list[dict], model: str,
     return data["choices"][0]["message"]["content"], data.get("usage", {})
 
 
-def _validate_story(parsed: dict) -> tuple[bool, str | None]:
+MIN_WORDS_HARD_FLOOR = 500   # piso absoluto, debajo es inutil aunque haya hueco
+MAX_WORDS_HARD_CEILING = 4500  # techo absoluto, arriba es inviable de procesar
+
+
+def _validate_story(parsed: dict, min_words: int = MIN_WORDS_HARD_FLOOR,
+                    max_words: int = MAX_WORDS_HARD_CEILING) -> tuple[bool, str | None]:
     required = ["title", "story", "self_quality_score", "self_horror_score"]
     for k in required:
         if k not in parsed:
@@ -169,9 +177,9 @@ def _validate_story(parsed: dict) -> tuple[bool, str | None]:
     if len(parsed["title"]) > 100:
         return False, "title_too_long"
     wc = _word_count(parsed["story"])
-    if wc < 800:
+    if wc < min_words:
         return False, f"story_too_short:{wc}"
-    if wc > 4000:
+    if wc > max_words:
         return False, f"story_too_long:{wc}"
     # Filtro basico de contenido prohibido (capa extra, GPT ya lo hace)
     forbidden = ["niño", "menor de edad", "violacion", "incesto"]
@@ -190,12 +198,16 @@ async def generate_story(
     themes_pool: Optional[list[str]] = None,
     settings_pool: Optional[list[str]] = None,
     tones_pool: Optional[list[str]] = None,
-    min_words: int = 1500,
+    min_words: int = 1200,
     max_words: int = 2800,
     model: Optional[str] = None,
     seed_id: Optional[str] = None,
 ) -> dict:
-    """Genera una historia original. Devuelve dict con story + meta."""
+    """Genera una historia original. Devuelve dict con story + meta.
+
+    Si GPT genera muy corto (suele pasar con gpt-4o-mini), reintenta una
+    vez pidiendo expansion explicita antes de fallar.
+    """
     model = model or settings.openai_model_cheap
     themes = themes_pool or DEFAULT_THEMES
     sets = settings_pool or DEFAULT_SETTINGS
@@ -222,16 +234,57 @@ async def generate_story(
     ]
 
     content, usage = await _call_openai(messages, model)
-    cost = _calc_cost(model, usage)
+    total_in_tokens = usage.get("prompt_tokens", 0)
+    total_out_tokens = usage.get("completion_tokens", 0)
 
     try:
         parsed = json.loads(_strip_to_json(content))
     except json.JSONDecodeError as e:
         raise RuntimeError(f"GPT devolvio JSON invalido: {e}") from e
 
+    # Validacion con piso absoluto (MIN_WORDS_HARD_FLOOR=500)
     ok, err = _validate_story(parsed)
+
+    # Auto-retry una vez si la historia es corta (GPT-4o-mini suele acortar)
+    if not ok and err and err.startswith("story_too_short:") and parsed.get("story"):
+        current_wc = _word_count(parsed["story"])
+        target_extra = max(min_words - current_wc, 600)
+        expand_user_msg = (
+            f"La historia anterior tiene {current_wc} palabras pero necesito al "
+            f"menos {min_words}. Reescribela COMPLETA expandiendo escenas con "
+            f"mas descripcion sensorial, monologo interior, dialogo y atmosfera, "
+            f"manteniendo el mismo argumento y final. Anade aproximadamente "
+            f"{target_extra} palabras adicionales repartidas por toda la "
+            "narracion (no solo al final). Devuelve el mismo JSON con la "
+            "historia ampliada."
+        )
+        retry_messages = messages + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": expand_user_msg},
+        ]
+        content2, usage2 = await _call_openai(retry_messages, model)
+        total_in_tokens += usage2.get("prompt_tokens", 0)
+        total_out_tokens += usage2.get("completion_tokens", 0)
+        try:
+            parsed2 = json.loads(_strip_to_json(content2))
+            # Mantenemos el self_assessment del primer intento si el retry no lo trae
+            for fb_field in ("self_quality_score", "self_horror_score",
+                             "self_assessment", "core_image_keywords"):
+                if fb_field not in parsed2 and fb_field in parsed:
+                    parsed2[fb_field] = parsed[fb_field]
+            parsed = parsed2
+            ok, err = _validate_story(parsed)
+        except json.JSONDecodeError:
+            # nos quedamos con el original; ok seguira False
+            pass
+
     if not ok:
         raise RuntimeError(f"Historia rechazada por validador: {err}")
+
+    cost = _calc_cost(model, {
+        "prompt_tokens": total_in_tokens,
+        "completion_tokens": total_out_tokens,
+    })
 
     return {
         "title": parsed["title"],
@@ -248,8 +301,8 @@ async def generate_story(
             "word_count": _word_count(parsed["story"]),
             "selftext_hash": _hash_story(parsed["story"]),
             "model": model,
-            "tokens_in": usage.get("prompt_tokens", 0),
-            "tokens_out": usage.get("completion_tokens", 0),
+            "tokens_in": total_in_tokens,
+            "tokens_out": total_out_tokens,
             "cost_usd": cost,
             "seed_id": seed_id,
         },

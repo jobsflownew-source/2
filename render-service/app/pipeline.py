@@ -18,6 +18,7 @@ from PIL import Image
 from . import db
 from .config import settings
 from .images import download_image, find_best_image
+from .images_placeholder import generate_placeholder_image
 from .script_gen import generate_script
 from .storage import get_storage
 from .tts import synthesize
@@ -83,14 +84,16 @@ async def _produce_segment_audio(
         if segment_index > 0
         else f"{segment.get('text','')}"
     )
-    await synthesize(text_for_tts, audio_path, voice=voice, provider="edge")
+    _, _, provider_used = await synthesize(
+        text_for_tts, audio_path, voice=voice, provider="auto"
+    )
     duration = get_duration_sec(audio_path)
     storage = get_storage()
     obj = f"audio/{script_id}/seg_{segment_index:02d}.mp3"
     url = storage.upload_file(audio_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="audio", source="edge_tts",
+        asset_type="audio", source=provider_used,
         storage_url=url,
         duration_ms=int(duration * 1000),
         file_size_bytes=audio_path.stat().st_size,
@@ -102,26 +105,65 @@ async def _produce_segment_audio(
 async def _produce_segment_image(
     segment: dict, work_dir: Path,
     script_id: int, segment_index: int,
+    excluded_urls: Optional[set[str]] = None,
 ) -> Path:
+    """Obtiene una imagen para el segmento.
+
+    Cascada de fallbacks:
+    1. find_best_image con las keywords del segmento (Pixabay/Unsplash/Pexels)
+       excluyendo URLs ya usadas en los ultimos N dias.
+    2. find_best_image con keyword generica segun el mood (tambien con dedup).
+    3. generate_placeholder_image local (gradiente cinematografico) -> JAMAS falla.
+
+    Despues de elegir una imagen externa, se registra en used_images para
+    que no vuelva a aparecer en el cooldown configurado (image_cooldown_days).
+    """
     keywords = segment.get("keywords") or []
-    image_meta = await find_best_image(keywords)
+    mood = segment.get("mood") or "tension"
+    excluded = excluded_urls if excluded_urls is not None else set()
+
+    image_meta = await find_best_image(keywords, excluded_urls=excluded)
     if not image_meta:
-        # Fallback: keyword generica del mood
         fallback_kw = {
             "tension": ["dark forest fog"],
             "fear": ["abandoned hallway dim"],
             "despair": ["empty room shadow"],
             "reveal": ["open door darkness"],
             "aftermath": ["broken window night"],
-        }.get(segment.get("mood", ""), ["abandoned house at night"])
-        image_meta = await find_best_image(fallback_kw)
-    if not image_meta:
-        raise RuntimeError(f"No image found for segment {segment_index}")
+        }.get(mood, ["abandoned house at night"])
+        image_meta = await find_best_image(fallback_kw, excluded_urls=excluded)
 
     img_path = work_dir / f"img_{segment_index:02d}.jpg"
-    await download_image(image_meta, img_path)
 
-    # Tamano real para meta
+    if image_meta:
+        await download_image(image_meta, img_path)
+        source = image_meta["source"]
+        original_url = image_meta.get("download") or image_meta.get("url") or ""
+        # Registrar para que el dedup futuro la excluya. Tambien la
+        # anadimos al set local para que el mismo short no use la misma
+        # imagen en varios segmentos.
+        if original_url:
+            await db.record_image_used(
+                image_url=original_url, source=source,
+                script_id=script_id, segment_index=segment_index,
+            )
+            excluded.add(original_url)
+        meta_extra = {
+            "author": image_meta.get("author"),
+            "keywords": keywords[:5],
+            "image_url": original_url,
+        }
+    else:
+        # Sin APIs configuradas o todas fallaron -> placeholder local
+        log.warning(
+            "no_stock_image_found segment=%s mood=%s using_placeholder",
+            segment_index, mood,
+        )
+        seed = f"{script_id}_{segment_index}_{'-'.join(keywords[:3])}"
+        await asyncio.to_thread(generate_placeholder_image, img_path, mood, seed)
+        source = "placeholder"
+        meta_extra = {"keywords": keywords[:5], "mood": mood}
+
     with Image.open(img_path) as im:
         w, h = im.size
 
@@ -130,11 +172,10 @@ async def _produce_segment_image(
     url = storage.upload_file(img_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="image", source=image_meta["source"],
+        asset_type="image", source=source,
         storage_url=url, width=w, height=h,
         file_size_bytes=img_path.stat().st_size,
-        meta={"author": image_meta.get("author"),
-              "keywords": keywords[:5]},
+        meta=meta_extra,
     )
     return img_path
 
@@ -158,18 +199,31 @@ async def produce_short(
     )
     log.info("produce script_id=%s segs=%d", script_id, len(script["segments"]))
 
-    voice = voice or settings.tts_default_voice
+    # Selector de voz: si no se pasa explicita, rota desde el banco curado
+    if not voice:
+        voice = await db.pick_next_voice(language=language)
+        await db.record_voice_use(voice)
+        log.info("voice_auto_selected voice=%s script_id=%s", voice, script_id)
     work_dir = WORKSPACE / "produce" / f"script_{script_id}"
     if work_dir.exists():
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. Assets por segmento (paralelo)
+    # Cargar el set de URLs ya usadas (cooldown configurable en
+    # policy_params.image_cooldown_days, default 30 dias) UNA sola vez
+    # para todo el short, para que las imagenes elegidas en este short
+    # tampoco se repitan entre segmentos.
+    excluded_urls = await db.get_recent_image_urls()
+    log.info("image_dedup script_id=%s excluded=%d", script_id, len(excluded_urls))
+
     segments = script["segments"]
     tasks = []
     for i, seg in enumerate(segments):
         tasks.append(_produce_segment_audio(seg, voice, work_dir, script_id, i))
-        tasks.append(_produce_segment_image(seg, work_dir, script_id, i))
+        tasks.append(_produce_segment_image(
+            seg, work_dir, script_id, i, excluded_urls=excluded_urls,
+        ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     # Comprobar errores
