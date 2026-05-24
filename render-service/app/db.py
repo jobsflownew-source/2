@@ -223,6 +223,72 @@ async def update_short_status(short_id: int, status: str,
     )
 
 
+async def get_short(short_id: int) -> Optional[dict]:
+    return await aexec(
+        "SELECT id, script_id, language, voice_id, title, description, tags,"
+        " final_video_url, duration_sec, file_size_bytes, status,"
+        " youtube_video_id, channel_id, scheduled_for, published_at,"
+        " error_message, created_at"
+        " FROM shorts WHERE id = %s",
+        (short_id,), fetch="one",
+    )
+
+
+async def pick_next_rendered(limit: int = 1, language: Optional[str] = None) -> list[dict]:
+    """Shorts listos para subir (status='rendered', no subidos aun)."""
+    if language:
+        return await aexec(
+            "SELECT id, script_id, language, title, description, tags,"
+            " final_video_url, duration_sec, file_size_bytes"
+            " FROM shorts"
+            " WHERE status = 'rendered' AND language = %s"
+            " ORDER BY created_at ASC"
+            " LIMIT %s",
+            (language, limit), fetch="all",
+        ) or []
+    return await aexec(
+        "SELECT id, script_id, language, title, description, tags,"
+        " final_video_url, duration_sec, file_size_bytes"
+        " FROM shorts"
+        " WHERE status = 'rendered'"
+        " ORDER BY created_at ASC"
+        " LIMIT %s",
+        (limit,), fetch="all",
+    ) or []
+
+
+async def set_short_youtube(short_id: int, youtube_video_id: str,
+                            channel_id: Optional[str] = None) -> None:
+    """Marca el short como published con su video_id de YouTube."""
+    await aexec(
+        "UPDATE shorts SET status = 'published',"
+        " youtube_video_id = %s,"
+        " channel_id = COALESCE(%s, channel_id),"
+        " published_at = now()"
+        " WHERE id = %s",
+        (youtube_video_id, channel_id, short_id),
+    )
+
+
+async def shorts_uploaded_today(language: Optional[str] = None) -> int:
+    """Cuantos shorts se han subido a YouTube hoy (para respetar quota)."""
+    if language:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE language = %s AND status = 'published'"
+            "   AND published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            (language,), fetch="one",
+        )
+    else:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE status = 'published'"
+            "   AND published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            fetch="one",
+        )
+    return int(row["n"]) if row else 0
+
+
 # ------------------ Cost ledger ------------------
 async def log_cost(service: str, operation: str, units: float,
                    cost_usd: float, script_id: Optional[int] = None,
@@ -263,3 +329,99 @@ async def policy_get(key: str, default: Any = None) -> Any:
         (key,), fetch="one",
     )
     return row["value"] if row else default
+
+
+# ------------------ Voice rotation (multi-armed bandit) ------------------
+async def pick_next_voice(language: str = "es") -> str:
+    """Selecciona la siguiente voz por round-robin (menos usada primero).
+
+    Lee policy_params.voices, filtra por idioma (matching prefix es-),
+    y elige la que tiene menos pulls en bandit_arms. Cuando haya datos
+    de retencion de YouTube se evolucionara a Thompson sampling con
+    rewards_sum (eso es WF6_Optimizer, futuro).
+    """
+    voices = await policy_get("voices", default=["es-ES-AlvaroNeural"])
+    if not isinstance(voices, list) or not voices:
+        return "es-ES-AlvaroNeural"
+
+    # Filtrar por idioma (es -> matching es-ES, es-MX, es-CO, etc.)
+    lang_prefix = language.split("-")[0] if "-" in language else language
+    matching = [v for v in voices if v.startswith(f"{lang_prefix}-")]
+    if not matching:
+        matching = voices
+
+    # Round-robin justo: la de menos pulls, luego la mas antigua
+    row = await aexec(
+        "WITH pool AS (SELECT unnest(%s::text[]) AS voice),"
+        " stats AS ("
+        "  SELECT p.voice,"
+        "         COALESCE(b.pulls, 0) AS pulls,"
+        "         b.last_used"
+        "  FROM pool p"
+        "  LEFT JOIN bandit_arms b"
+        "    ON b.arm_type = 'voice' AND b.arm_value = p.voice"
+        " )"
+        " SELECT voice FROM stats"
+        " ORDER BY pulls ASC, last_used ASC NULLS FIRST"
+        " LIMIT 1",
+        (matching,), fetch="one",
+    )
+    return row["voice"] if row else matching[0]
+
+
+async def record_voice_use(voice_id: str) -> None:
+    """Registra +1 pull en bandit_arms para esta voz."""
+    await aexec(
+        "INSERT INTO bandit_arms (arm_type, arm_value, pulls, last_used)"
+        " VALUES ('voice', %s, 1, now())"
+        " ON CONFLICT (arm_type, arm_value)"
+        " DO UPDATE SET pulls = bandit_arms.pulls + 1, last_used = now()",
+        (voice_id,),
+    )
+
+
+# ------------------ Image deduplication ------------------
+async def get_recent_image_urls(days: Optional[int] = None) -> set[str]:
+    """Devuelve el set de URLs de imagenes ya usadas en los ultimos N dias.
+
+    Si days es None, lee 'image_cooldown_days' de policy_params (default 30).
+    Se usa para excluir candidatas en find_best_image y evitar reutilizar
+    las mismas imagenes en shorts diferentes.
+    """
+    if days is None:
+        cooldown = await policy_get("image_cooldown_days", default=30)
+        try:
+            days = int(cooldown)
+        except (TypeError, ValueError):
+            days = 30
+
+    rows = await aexec(
+        "SELECT image_url FROM used_images"
+        " WHERE last_used_at >= now() - make_interval(days => %s)",
+        (days,), fetch="all",
+    ) or []
+    return {r["image_url"] for r in rows if r.get("image_url")}
+
+
+async def record_image_used(
+    image_url: str, source: str,
+    script_id: Optional[int] = None,
+    segment_index: Optional[int] = None,
+) -> None:
+    """Registra que una URL de imagen externa fue usada.
+
+    Si ya existia, incrementa times_used y actualiza last_used_at.
+    Si es nueva, la inserta. Idempotente.
+    """
+    if not image_url:
+        return
+    await aexec(
+        "INSERT INTO used_images"
+        "  (image_url, source, first_used_at, last_used_at, times_used,"
+        "   first_script_id, first_segment)"
+        " VALUES (%s, %s, now(), now(), 1, %s, %s)"
+        " ON CONFLICT (image_url) DO UPDATE"
+        "   SET times_used = used_images.times_used + 1,"
+        "       last_used_at = now()",
+        (image_url, source, script_id, segment_index),
+    )

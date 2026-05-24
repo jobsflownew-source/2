@@ -1,7 +1,13 @@
-"""TTS service. Edge-TTS (free) primary, Azure as premium fallback."""
+"""TTS service. Auto-selects Azure (premium) if configured, else Edge-TTS (free).
+
+Microsoft sometimes blocks Edge-TTS from datacenter or VPN IPs (returns
+WSServerHandshakeError). Configuring AZURE_SPEECH_KEY makes the service
+robust against that, falling back to Edge as last resort.
+"""
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from pathlib import Path
 from typing import Literal
@@ -10,6 +16,8 @@ import edge_tts
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .config import settings
+
+log = logging.getLogger(__name__)
 
 
 # Mapeo voces es-ES en Edge -> aproximaciones (Edge usa los mismos nombres
@@ -56,29 +64,66 @@ async def synthesize_edge_tts(
     return out_path, boundaries
 
 
+def _resolve_provider(provider: str) -> Literal["edge", "azure"]:
+    """Resuelve el provider real a partir del solicitado.
+
+    'auto' -> azure si hay key configurada, edge en otro caso.
+    """
+    if provider == "auto":
+        return "azure" if settings.azure_speech_key else "edge"
+    return provider  # type: ignore[return-value]
+
+
 async def synthesize(
     text: str,
     out_path: str | Path,
     voice: str | None = None,
-    provider: Literal["edge", "azure"] = "edge",
+    provider: Literal["edge", "azure", "auto"] = "auto",
 ) -> tuple[Path, list[dict], str]:
-    """Punto de entrada unificado. Devuelve (path, boundaries, provider_used)."""
-    if provider == "edge":
-        path, bounds = await synthesize_edge_tts(text, out_path, voice=voice)
-        return path, bounds, "edge_tts"
+    """Punto de entrada unificado. Devuelve (path, boundaries, provider_used).
 
-    # Azure: solo si tenemos credenciales
-    if provider == "azure" and settings.azure_speech_key:
+    Estrategia:
+    - provider='auto' (default): Azure si hay key, Edge en otro caso.
+    - Si el primario falla, intenta el otro como fallback automatico.
+    """
+    primary = _resolve_provider(provider)
+
+    # Intento primario
+    if primary == "azure":
+        if not settings.azure_speech_key:
+            # piden azure explicito pero sin key -> edge
+            path, bounds = await synthesize_edge_tts(text, out_path, voice=voice)
+            return path, bounds, "edge_tts"
         try:
             from .tts_azure import synthesize_azure
             return await synthesize_azure(text, out_path, voice=voice)
-        except Exception:
-            # fallback a edge
-            path, bounds = await synthesize_edge_tts(text, out_path, voice=voice)
-            return path, bounds, "edge_tts_fallback"
+        except Exception as e:
+            log.warning("azure_tts_failed_fallback_to_edge error=%s", e)
+            try:
+                path, bounds = await synthesize_edge_tts(
+                    text, out_path, voice=voice
+                )
+                return path, bounds, "edge_tts_fallback"
+            except Exception as e2:
+                log.error("both_tts_providers_failed azure=%s edge=%s", e, e2)
+                raise
 
-    path, bounds = await synthesize_edge_tts(text, out_path, voice=voice)
-    return path, bounds, "edge_tts"
+    # primary == "edge"
+    try:
+        path, bounds = await synthesize_edge_tts(text, out_path, voice=voice)
+        return path, bounds, "edge_tts"
+    except Exception as edge_err:
+        # Si Edge falla pero hay Azure configurado, fallback a Azure
+        if settings.azure_speech_key:
+            log.warning("edge_tts_failed_fallback_to_azure error=%s", edge_err)
+            try:
+                from .tts_azure import synthesize_azure
+                return await synthesize_azure(text, out_path, voice=voice)
+            except Exception as az_err:
+                log.error("both_tts_providers_failed edge=%s azure=%s",
+                          edge_err, az_err)
+                raise
+        raise
 
 
 async def list_voices(language: str | None = None) -> list[dict]:
