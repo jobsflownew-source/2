@@ -24,7 +24,8 @@ from .image_selection import select_best_image_with_ai
 from .script_gen import generate_script
 from .storage import get_storage
 from .tts import synthesize
-from .video import Segment, get_duration_sec, render_short
+from .video import (DEFAULT_MOOD_COLORS, RenderConfig, Segment,
+                    get_duration_sec, render_short)
 
 log = logging.getLogger(__name__)
 
@@ -333,23 +334,81 @@ async def produce_short(
             audio_path=audio_path,
             text=seg["text"],
             duration_sec=dur,
+            mood=(seg.get("mood") or "default").lower(),
         ))
 
     # 4. Render final
     output_path = work_dir / "final.mp4"
     music_path: Optional[Path] = None
+
+    # Si el caller no paso music_url, leemos un track aleatorio del banco
+    # configurado en policy_params.music_tracks_horror, siempre que
+    # music_enabled=true.
+    if not music_url:
+        music_enabled = await db.policy_get("music_enabled", default=True)
+        if music_enabled:
+            tracks = await db.policy_get("music_tracks_horror", default=[])
+            if isinstance(tracks, list) and tracks:
+                music_url = random.choice(tracks)
+                log.info("music_auto_selected url=%s", music_url[:80])
+
     if music_url:
-        # download to local
         import httpx
         music_path = work_dir / "music.mp3"
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-            r = await c.get(music_url)
-            r.raise_for_status()
-            music_path.write_bytes(r.content)
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                r = await c.get(music_url)
+                r.raise_for_status()
+                music_path.write_bytes(r.content)
+        except Exception as e:
+            log.warning("music_download_failed err=%s url=%s", e, music_url[:80])
+            music_path = None
+
+    # Config de render (transiciones, fuente, colores por mood, volumen)
+    # leida en caliente desde policy_params -> ajustes sin redeploy.
+    transitions_enabled = bool(
+        await db.policy_get("video_transitions_enabled", default=True)
+    )
+    transition_sec_raw = await db.policy_get("video_transition_sec", default=0.4)
+    try:
+        transition_sec = float(transition_sec_raw)
+    except (TypeError, ValueError):
+        transition_sec = 0.4
+    music_volume_raw = await db.policy_get("music_volume", default=0.15)
+    try:
+        music_volume = float(music_volume_raw)
+    except (TypeError, ValueError):
+        music_volume = 0.15
+    subtitle_font = await db.policy_get("subtitle_font", default="Liberation Sans Bold")
+    if not isinstance(subtitle_font, str) or not subtitle_font:
+        subtitle_font = "Liberation Sans Bold"
+    mood_colors_raw = await db.policy_get(
+        "subtitle_colors_by_mood", default=None,
+    )
+    mood_colors = (
+        dict(mood_colors_raw)
+        if isinstance(mood_colors_raw, dict) and mood_colors_raw
+        else dict(DEFAULT_MOOD_COLORS)
+    )
+
+    render_cfg = RenderConfig(
+        burn_subtitles=burn_subtitles,
+        transitions_enabled=transitions_enabled,
+        transition_sec=transition_sec,
+        music_volume=music_volume,
+        subtitle_font=subtitle_font,
+        mood_colors=mood_colors,
+    )
+    log.info(
+        "render_config script_id=%s transitions=%s xfade=%.2fs"
+        " music_vol=%.2f font=%s music=%s",
+        script_id, transitions_enabled, transition_sec,
+        music_volume, subtitle_font, bool(music_path),
+    )
 
     await asyncio.to_thread(
         render_short, render_segments, work_dir, output_path,
-        music_path, burn_subtitles,
+        music_path, burn_subtitles, render_cfg,
     )
 
     final_duration = get_duration_sec(output_path)
