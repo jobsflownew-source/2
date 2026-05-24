@@ -1,0 +1,92 @@
+{
+  "name": "WF6_AnalyticsTracker",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "cron-daily-0630",
+      "name": "Daily 06:30 UTC",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://render-service:8000/metrics/refresh-youtube",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {"name": "X-API-Key", "value": "={{ $env.RENDER_API_KEY }}"},
+            {"name": "Content-Type", "value": "application/json"}
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"days\": 30\n}",
+        "options": {
+          "timeout": 300000,
+          "retry": {
+            "enabled": true,
+            "maxRetries": 1,
+            "waitBetweenTries": 30000
+          }
+        }
+      },
+      "id": "call-refresh",
+      "name": "Refresh YouTube metrics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT short_id,\n       LEFT(title, 60) AS title_short,\n       views,\n       likes,\n       comments,\n       ROUND(views_per_hour::numeric, 2) AS vph,\n       ROUND((hours_since_publish)::numeric, 1) AS hours_old\nFROM app.shorts_performance_24h\nORDER BY views_per_hour DESC NULLS LAST\nLIMIT 5;"
+      },
+      "id": "fetch-top",
+      "name": "Top 5 by VPH",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [720, 300],
+      "credentials": {
+        "postgres": {
+          "id": "postgres-app",
+          "name": "Postgres app"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF6 Daily YouTube Metrics\",\n    \"description\": \"Refresh diario de stats YouTube + top 5 shorts por views/hour.\\n\\n**Tracked:** {{ $('Refresh YouTube metrics').item.json.shorts_tracked || 0 }}\\n**Fetched:** {{ $('Refresh YouTube metrics').item.json.videos_fetched || 0 }}\\n**Inserted:** {{ $('Refresh YouTube metrics').item.json.rows_inserted || 0 }}\",\n    \"fields\": [\n      {\"name\": \"#1\", \"value\": \"**[{{ $('Top 5 by VPH').first().json.short_id }}]** {{ $('Top 5 by VPH').first().json.title_short }} ({{ $('Top 5 by VPH').first().json.views }} views, {{ $('Top 5 by VPH').first().json.vph }}/h)\", \"inline\": false}\n    ],\n    \"color\": 7506394\n  }]\n}",
+        "options": {}
+      },
+      "id": "discord-summary",
+      "name": "Discord Daily Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 300],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Daily 06:30 UTC": {"main": [[{"node": "Refresh YouTube metrics", "type": "main", "index": 0}]]},
+    "Refresh YouTube metrics": {"main": [[{"node": "Top 5 by VPH", "type": "main", "index": 0}]]},
+    "Top 5 by VPH": {"main": [[{"node": "Discord Daily Summary", "type": "main", "index": 0}]]}
+  },
+  "settings": {"executionOrder": "v1"},
+  "tags": [{"name": "horror-shorts"}, {"name": "analytics"}, {"name": "tracker"}]
+}
