@@ -425,3 +425,79 @@ async def record_image_used(
         "       last_used_at = now()",
         (image_url, source, script_id, segment_index),
     )
+
+
+
+
+# ------------------ TikTok publishing ------------------
+async def pick_next_for_tiktok(limit: int = 1, language: Optional[str] = None) -> list[dict]:
+    """Shorts listos para subir a TikTok.
+
+    Selecciona los que estan rendered (al menos) y aun no publicados en
+    TikTok. Acepta tambien los que ya estan publicados en YouTube
+    (status='published') porque YouTube y TikTok son destinos paralelos.
+    """
+    where_lang = " AND s.language = %s" if language else ""
+    args = [language, limit] if language else [limit]
+    return await aexec(
+        f"SELECT s.id, s.script_id, s.language, s.title, s.description, s.tags,"
+        f" s.final_video_url, s.duration_sec, s.file_size_bytes, s.status,"
+        f" s.tiktok_status, s.tiktok_video_id"
+        f" FROM shorts s"
+        f" WHERE s.status IN ('rendered','uploading','published')"
+        f"   AND (s.tiktok_status IS NULL"
+        f"        OR s.tiktok_status IN ('pending','failed'))"
+        f"   {where_lang}"
+        f" ORDER BY s.created_at ASC"
+        f" LIMIT %s",
+        tuple(args), fetch="all",
+    ) or []
+
+
+async def set_short_tiktok(
+    short_id: int,
+    publish_id: Optional[str] = None,
+    video_id: Optional[str] = None,
+    status: str = "published",
+    url: Optional[str] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Actualiza los campos tiktok_* de un short.
+
+    Status validos: 'pending' | 'uploading' | 'published' | 'failed' | 'disabled'.
+    Si status='published' graba published_at. Si status='failed' graba error.
+    """
+    await aexec(
+        "UPDATE shorts SET"
+        "  tiktok_publish_id = COALESCE(%s, tiktok_publish_id),"
+        "  tiktok_video_id   = COALESCE(%s, tiktok_video_id),"
+        "  tiktok_url        = COALESCE(%s, tiktok_url),"
+        "  tiktok_status     = %s,"
+        "  tiktok_published_at = CASE WHEN %s = 'published'"
+        "                             THEN COALESCE(tiktok_published_at, now())"
+        "                             ELSE tiktok_published_at END,"
+        "  tiktok_error      = CASE WHEN %s = 'failed' THEN %s"
+        "                           ELSE NULL END"
+        " WHERE id = %s",
+        (publish_id, video_id, url, status, status, status, error, short_id),
+    )
+
+
+async def tiktok_uploaded_today(language: Optional[str] = None) -> int:
+    """Cuantos shorts se han publicado en TikTok hoy (cuota diaria)."""
+    if language:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE language = %s"
+            "   AND tiktok_status = 'published'"
+            "   AND tiktok_published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            (language,), fetch="one",
+        )
+    else:
+        row = await aexec(
+            "SELECT COUNT(*) AS n FROM shorts"
+            " WHERE tiktok_status = 'published'"
+            "   AND tiktok_published_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')",
+            fetch="one",
+        )
+    return int(row["n"]) if row else 0

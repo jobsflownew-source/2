@@ -564,3 +564,158 @@ async def publish_today(language: Optional[str] = None):
     except (TypeError, ValueError):
         max_n = 5
     return {"language": language, "uploaded_today": n, "max_per_day": max_n}
+
+
+# ---------- TikTok publishing (WF5) ----------
+class PublishTikTokRequest(BaseModel):
+    short_id: int
+    mode: Optional[str] = None              # 'inbox' | 'direct'
+    privacy_level: Optional[str] = None     # solo aplica en 'direct'
+    poll: bool = True
+
+
+@app.post("/publish-tiktok", dependencies=[Depends(require_api_key)])
+async def publish_tiktok_endpoint(req: PublishTikTokRequest):
+    """Sube un Short rendered a TikTok via Content Posting API.
+
+    Modos:
+    - 'inbox' (default): video llega al inbox/drafts del creador. NO requiere
+      app audit. El creador debe darle "Post" en la app de TikTok para
+      publicarlo. Util para trabajar antes de pasar audit.
+    - 'direct':   publica directamente. Requiere app audit (1-2 sem) +
+      scope video.publish.
+
+    El modo se controla globalmente con policy_params.tiktok_publish_mode.
+    """
+    short = await db.get_short(req.short_id)
+    if not short:
+        raise HTTPException(404, f"Short {req.short_id} not found")
+
+    # Validacion del estado del short
+    if short["status"] not in ("rendered", "uploading", "published"):
+        raise HTTPException(
+            409,
+            f"Short {req.short_id} status={short['status']} not eligible for TikTok",
+        )
+
+    # Idempotencia: si ya publicado en TikTok, devolver
+    if short.get("tiktok_status") == "published" and short.get("tiktok_publish_id"):
+        return {
+            "short_id": req.short_id,
+            "tiktok_publish_id": short["tiktok_publish_id"],
+            "tiktok_video_id": short.get("tiktok_video_id"),
+            "tiktok_url": short.get("tiktok_url"),
+            "status": "already_published",
+        }
+
+    # Toggle global
+    enabled = await db.policy_get("tiktok_enabled", default=True)
+    if not enabled:
+        raise HTTPException(503, "TikTok publishing is disabled in policy_params")
+
+    # Lazy import para no romper si las libs no estan
+    try:
+        from .tiktok import upload_video as tiktok_upload
+    except ImportError as e:
+        raise HTTPException(500, f"TikTok module not available: {e}")
+
+    # Resolver modo y privacy
+    mode = req.mode or await db.policy_get("tiktok_publish_mode", default="inbox")
+    if not isinstance(mode, str):
+        mode = "inbox"
+    privacy = req.privacy_level or await db.policy_get(
+        "tiktok_privacy_level", default="SELF_ONLY",
+    )
+
+    # Marcar uploading
+    await db.set_short_tiktok(req.short_id, status="uploading")
+
+    # Descargar el MP4 del MinIO al workspace local
+    work = WORKSPACE / "publish-tiktok" / str(req.short_id)
+    work.mkdir(parents=True, exist_ok=True)
+    local_mp4 = work / "final.mp4"
+
+    try:
+        await _download(short["final_video_url"], local_mp4)
+
+        result = await tiktok_upload(
+            local_mp4,
+            title=short["title"] or "",
+            description=short["description"] or "",
+            tags=short["tags"] or [],
+            mode=mode,
+            privacy_level=privacy if isinstance(privacy, str) else None,
+            poll=req.poll,
+        )
+
+        publish_id = result.get("publish_id")
+        tiktok_status_raw = (result.get("status") or "").upper()
+
+        # Mapear status de TikTok a nuestro enum interno
+        if tiktok_status_raw in ("PUBLISH_COMPLETE", "PUBLISH_OK"):
+            our_status = "published"
+        elif tiktok_status_raw == "SEND_TO_USER_INBOX":
+            # Modo inbox: el video llego al inbox del creador. Lo marcamos
+            # published a efectos del pipeline (la entrega fue exitosa).
+            our_status = "published"
+        elif tiktok_status_raw in ("FAILED", "PUBLISH_FAILED"):
+            our_status = "failed"
+        elif tiktok_status_raw in ("PROCESSING_DOWNLOAD", "PROCESSING_UPLOAD"):
+            # TikTok aun lo procesa. Lo marcamos published (best-effort) y el
+            # proximo poll lo refinara si fuera necesario.
+            our_status = "published"
+        else:
+            our_status = "uploading"
+
+        url = (
+            f"https://www.tiktok.com/@me/video/{publish_id}"
+            if our_status == "published" else None
+        )
+
+        await db.set_short_tiktok(
+            req.short_id,
+            publish_id=publish_id,
+            status=our_status,
+            url=url,
+        )
+
+        await db.log_cost(
+            service="tiktok", operation="video_upload",
+            units=1, cost_usd=0,
+            short_id=req.short_id,
+            meta={"publish_id": publish_id, "mode": mode,
+                  "tiktok_status": tiktok_status_raw},
+        )
+
+        return {
+            "short_id": req.short_id,
+            "tiktok_publish_id": publish_id,
+            "tiktok_status": tiktok_status_raw,
+            "status": our_status,
+            "mode": mode,
+            "url": url,
+            "title": short["title"],
+        }
+
+    except Exception as e:
+        log.exception("publish_tiktok_failed", short_id=req.short_id, error=str(e))
+        await db.set_short_tiktok(req.short_id, status="failed", error=str(e))
+        raise HTTPException(500, f"TikTok publish failed: {e}")
+
+
+@app.get("/publish-tiktok/queue", dependencies=[Depends(require_api_key)])
+async def publish_tiktok_queue(limit: int = 10, language: Optional[str] = None):
+    """Lista shorts pendientes de subir a TikTok."""
+    return await db.pick_next_for_tiktok(limit=limit, language=language)
+
+
+@app.get("/publish-tiktok/today", dependencies=[Depends(require_api_key)])
+async def publish_tiktok_today(language: Optional[str] = None):
+    """Cuantos shorts subidos hoy a TikTok y limite de policy."""
+    n = await db.tiktok_uploaded_today(language=language)
+    max_n = await db.policy_get("max_tiktok_uploads_per_day", default=10)
+    try:
+        max_n = int(max_n)
+    except (TypeError, ValueError):
+        max_n = 10
+    return {"language": language, "uploaded_today": n, "max_per_day": max_n}
