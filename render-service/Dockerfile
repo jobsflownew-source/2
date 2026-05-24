@@ -4,14 +4,18 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
-# FFmpeg + libs basicas para Pillow/MoviePy
+# FFmpeg + libs basicas para Pillow/MoviePy + fuentes Liberation/Roboto para
+# subtitulos cinematograficos (Liberation Sans Bold sustituye a Impact, libre).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         fonts-dejavu-core \
         fonts-noto \
+        fonts-liberation \
+        fonts-roboto \
         libsndfile1 \
         curl \
         ca-certificates \
+    && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

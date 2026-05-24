@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -17,11 +18,16 @@ from PIL import Image
 
 from . import db
 from .config import settings
-from .images import download_image, find_best_image
+from .images import download_image, find_best_image, find_image_candidates
+from .images_placeholder import generate_placeholder_image
+from .image_selection import select_best_image_with_ai
+from .quality_gate import evaluate_short
 from .script_gen import generate_script
 from .storage import get_storage
+from .thumbnail_gen import generate_thumbnail
 from .tts import synthesize
-from .video import Segment, get_duration_sec, render_short
+from .video import (DEFAULT_MOOD_COLORS, RenderConfig, Segment,
+                    get_duration_sec, render_short)
 
 log = logging.getLogger(__name__)
 
@@ -83,14 +89,16 @@ async def _produce_segment_audio(
         if segment_index > 0
         else f"{segment.get('text','')}"
     )
-    await synthesize(text_for_tts, audio_path, voice=voice, provider="edge")
+    _, _, provider_used = await synthesize(
+        text_for_tts, audio_path, voice=voice, provider="auto"
+    )
     duration = get_duration_sec(audio_path)
     storage = get_storage()
     obj = f"audio/{script_id}/seg_{segment_index:02d}.mp3"
     url = storage.upload_file(audio_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="audio", source="edge_tts",
+        asset_type="audio", source=provider_used,
         storage_url=url,
         duration_ms=int(duration * 1000),
         file_size_bytes=audio_path.stat().st_size,
@@ -102,26 +110,114 @@ async def _produce_segment_audio(
 async def _produce_segment_image(
     segment: dict, work_dir: Path,
     script_id: int, segment_index: int,
+    excluded_urls: Optional[set[str]] = None,
+    ai_selection: bool = True,
+    ai_candidates_count: int = 6,
+    ai_model: str = "gpt-4o-mini",
 ) -> Path:
+    """Obtiene una imagen para el segmento.
+
+    Cascada:
+    1. Si ai_selection=True: pide find_image_candidates (top_k) y deja
+       que GPT-4o-mini-vision elija la mejor para el mood/keywords/texto.
+       Si la IA falla, cae a (2).
+    2. find_best_image con las keywords del segmento (random pick entre
+       las disponibles, excluyendo las ya usadas en N dias).
+    3. find_best_image con keyword generica segun el mood.
+    4. generate_placeholder_image local -> JAMAS falla.
+
+    Despues de elegir una imagen externa, se registra en used_images
+    para que no vuelva a aparecer en el cooldown configurado.
+    """
     keywords = segment.get("keywords") or []
-    image_meta = await find_best_image(keywords)
+    mood = segment.get("mood") or "tension"
+    excluded = excluded_urls if excluded_urls is not None else set()
+
+    image_meta: Optional[dict] = None
+    ai_selection_meta: Optional[dict] = None
+
+    # ---- 1. AI-driven selection ----
+    if ai_selection and keywords:
+        candidates = await find_image_candidates(
+            keywords, excluded_urls=excluded, top_k=ai_candidates_count,
+        )
+        if not candidates:
+            # Probar con fallback keywords ANTES de soltar el AI
+            fallback_kw = _fallback_keywords_for_mood(mood)
+            candidates = await find_image_candidates(
+                fallback_kw, excluded_urls=excluded, top_k=ai_candidates_count,
+            )
+        if candidates:
+            picked = await select_best_image_with_ai(
+                segment_text=segment.get("text", ""),
+                mood=mood,
+                keywords=keywords,
+                candidates=candidates,
+                model=ai_model,
+            )
+            if picked:
+                image_meta = picked
+                ai_selection_meta = picked.get("ai_selection")
+            else:
+                # IA fallo: pick aleatorio entre las que ya tenemos descargadas
+                image_meta = random.choice(candidates) if candidates else None
+
+    # ---- 2 + 3. fallback al random pick (sin IA) ----
     if not image_meta:
-        # Fallback: keyword generica del mood
-        fallback_kw = {
-            "tension": ["dark forest fog"],
-            "fear": ["abandoned hallway dim"],
-            "despair": ["empty room shadow"],
-            "reveal": ["open door darkness"],
-            "aftermath": ["broken window night"],
-        }.get(segment.get("mood", ""), ["abandoned house at night"])
-        image_meta = await find_best_image(fallback_kw)
+        image_meta = await find_best_image(keywords, excluded_urls=excluded)
     if not image_meta:
-        raise RuntimeError(f"No image found for segment {segment_index}")
+        fallback_kw = _fallback_keywords_for_mood(mood)
+        image_meta = await find_best_image(fallback_kw, excluded_urls=excluded)
 
     img_path = work_dir / f"img_{segment_index:02d}.jpg"
-    await download_image(image_meta, img_path)
 
-    # Tamano real para meta
+    if image_meta:
+        await download_image(image_meta, img_path)
+        source = image_meta["source"]
+        original_url = image_meta.get("download") or image_meta.get("url") or ""
+        # Registrar para que el dedup futuro la excluya. Tambien la
+        # anadimos al set local para que el mismo short no use la misma
+        # imagen en varios segmentos.
+        if original_url:
+            await db.record_image_used(
+                image_url=original_url, source=source,
+                script_id=script_id, segment_index=segment_index,
+            )
+            excluded.add(original_url)
+        meta_extra = {
+            "author": image_meta.get("author"),
+            "keywords": keywords[:5],
+            "image_url": original_url,
+        }
+        if ai_selection_meta:
+            meta_extra["ai_selection"] = ai_selection_meta
+            # Loguear coste del scoring para tracking
+            cost = ai_selection_meta.get("cost_usd", 0.0) or 0.0
+            if cost > 0:
+                await db.log_cost(
+                    service="openai", operation="image_selection_vision",
+                    units=ai_selection_meta.get("tokens_in", 0)
+                          + ai_selection_meta.get("tokens_out", 0),
+                    cost_usd=cost,
+                    script_id=script_id,
+                    meta={
+                        "model": ai_selection_meta.get("model"),
+                        "candidates_count": ai_selection_meta.get("candidates_count"),
+                        "score": ai_selection_meta.get("score"),
+                        "segment_index": segment_index,
+                    },
+                )
+    else:
+        # Sin APIs configuradas o todas fallaron -> placeholder local
+        log.warning(
+            "no_stock_image_found segment=%s mood=%s using_placeholder",
+            segment_index, mood,
+        )
+        seed = f"{script_id}_{segment_index}_{'-'.join(keywords[:3])}"
+        await asyncio.to_thread(generate_placeholder_image, img_path, mood, seed)
+        source = "placeholder"
+        meta_extra = {"keywords": keywords[:5], "mood": mood}
+
     with Image.open(img_path) as im:
         w, h = im.size
 
@@ -130,13 +226,23 @@ async def _produce_segment_image(
     url = storage.upload_file(img_path, obj)
     await db.insert_asset(
         script_id=script_id, segment_index=segment_index,
-        asset_type="image", source=image_meta["source"],
+        asset_type="image", source=source,
         storage_url=url, width=w, height=h,
         file_size_bytes=img_path.stat().st_size,
-        meta={"author": image_meta.get("author"),
-              "keywords": keywords[:5]},
+        meta=meta_extra,
     )
     return img_path
+
+
+def _fallback_keywords_for_mood(mood: str) -> list[str]:
+    """Keywords genericas por mood, en ingles, para el fallback de busqueda."""
+    return {
+        "tension": ["dark forest fog"],
+        "fear": ["abandoned hallway dim"],
+        "despair": ["empty room shadow"],
+        "reveal": ["open door darkness"],
+        "aftermath": ["broken window night"],
+    }.get(mood, ["abandoned house at night"])
 
 
 async def produce_short(
@@ -158,18 +264,56 @@ async def produce_short(
     )
     log.info("produce script_id=%s segs=%d", script_id, len(script["segments"]))
 
-    voice = voice or settings.tts_default_voice
+    # Selector de voz: si no se pasa explicita, rota desde el banco curado
+    if not voice:
+        voice = await db.pick_next_voice(language=language)
+        await db.record_voice_use(voice)
+        log.info("voice_auto_selected voice=%s script_id=%s", voice, script_id)
     work_dir = WORKSPACE / "produce" / f"script_{script_id}"
     if work_dir.exists():
         shutil.rmtree(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # 2. Assets por segmento (paralelo)
+    # Cargar el set de URLs ya usadas (cooldown configurable en
+    # policy_params.image_cooldown_days, default 30 dias) UNA sola vez
+    # para todo el short, para que las imagenes elegidas en este short
+    # tampoco se repitan entre segmentos.
+    excluded_urls = await db.get_recent_image_urls()
+
+    # Leer config de seleccion con IA (policy_params, evaluado por short
+    # para que los cambios apliquen sin redeploy).
+    ai_selection_raw = await db.policy_get("image_ai_selection", default=True)
+    ai_selection_enabled = bool(ai_selection_raw) and bool(settings.openai_api_key)
+    ai_candidates_count_raw = await db.policy_get(
+        "image_ai_candidates_count", default=6,
+    )
+    try:
+        ai_candidates_count = int(ai_candidates_count_raw)
+    except (TypeError, ValueError):
+        ai_candidates_count = 6
+    ai_model = await db.policy_get("image_ai_model", default="gpt-4o-mini")
+    if not isinstance(ai_model, str) or not ai_model:
+        ai_model = "gpt-4o-mini"
+
+    log.info(
+        "image_pipeline_config script_id=%s excluded=%d ai_selection=%s "
+        "candidates=%d model=%s",
+        script_id, len(excluded_urls), ai_selection_enabled,
+        ai_candidates_count, ai_model,
+    )
+
     segments = script["segments"]
     tasks = []
     for i, seg in enumerate(segments):
         tasks.append(_produce_segment_audio(seg, voice, work_dir, script_id, i))
-        tasks.append(_produce_segment_image(seg, work_dir, script_id, i))
+        tasks.append(_produce_segment_image(
+            seg, work_dir, script_id, i,
+            excluded_urls=excluded_urls,
+            ai_selection=ai_selection_enabled,
+            ai_candidates_count=ai_candidates_count,
+            ai_model=ai_model,
+        ))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     # Comprobar errores
@@ -192,23 +336,81 @@ async def produce_short(
             audio_path=audio_path,
             text=seg["text"],
             duration_sec=dur,
+            mood=(seg.get("mood") or "default").lower(),
         ))
 
     # 4. Render final
     output_path = work_dir / "final.mp4"
     music_path: Optional[Path] = None
+
+    # Si el caller no paso music_url, leemos un track aleatorio del banco
+    # configurado en policy_params.music_tracks_horror, siempre que
+    # music_enabled=true.
+    if not music_url:
+        music_enabled = await db.policy_get("music_enabled", default=True)
+        if music_enabled:
+            tracks = await db.policy_get("music_tracks_horror", default=[])
+            if isinstance(tracks, list) and tracks:
+                music_url = random.choice(tracks)
+                log.info("music_auto_selected url=%s", music_url[:80])
+
     if music_url:
-        # download to local
         import httpx
         music_path = work_dir / "music.mp3"
-        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
-            r = await c.get(music_url)
-            r.raise_for_status()
-            music_path.write_bytes(r.content)
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                r = await c.get(music_url)
+                r.raise_for_status()
+                music_path.write_bytes(r.content)
+        except Exception as e:
+            log.warning("music_download_failed err=%s url=%s", e, music_url[:80])
+            music_path = None
+
+    # Config de render (transiciones, fuente, colores por mood, volumen)
+    # leida en caliente desde policy_params -> ajustes sin redeploy.
+    transitions_enabled = bool(
+        await db.policy_get("video_transitions_enabled", default=True)
+    )
+    transition_sec_raw = await db.policy_get("video_transition_sec", default=0.4)
+    try:
+        transition_sec = float(transition_sec_raw)
+    except (TypeError, ValueError):
+        transition_sec = 0.4
+    music_volume_raw = await db.policy_get("music_volume", default=0.15)
+    try:
+        music_volume = float(music_volume_raw)
+    except (TypeError, ValueError):
+        music_volume = 0.15
+    subtitle_font = await db.policy_get("subtitle_font", default="Liberation Sans Bold")
+    if not isinstance(subtitle_font, str) or not subtitle_font:
+        subtitle_font = "Liberation Sans Bold"
+    mood_colors_raw = await db.policy_get(
+        "subtitle_colors_by_mood", default=None,
+    )
+    mood_colors = (
+        dict(mood_colors_raw)
+        if isinstance(mood_colors_raw, dict) and mood_colors_raw
+        else dict(DEFAULT_MOOD_COLORS)
+    )
+
+    render_cfg = RenderConfig(
+        burn_subtitles=burn_subtitles,
+        transitions_enabled=transitions_enabled,
+        transition_sec=transition_sec,
+        music_volume=music_volume,
+        subtitle_font=subtitle_font,
+        mood_colors=mood_colors,
+    )
+    log.info(
+        "render_config script_id=%s transitions=%s xfade=%.2fs"
+        " music_vol=%.2f font=%s music=%s",
+        script_id, transitions_enabled, transition_sec,
+        music_volume, subtitle_font, bool(music_path),
+    )
 
     await asyncio.to_thread(
         render_short, render_segments, work_dir, output_path,
-        music_path, burn_subtitles,
+        music_path, burn_subtitles, render_cfg,
     )
 
     final_duration = get_duration_sec(output_path)
@@ -228,6 +430,79 @@ async def produce_short(
         file_size_bytes=file_size,
     )
 
+    # 5b. Generar thumbnail con DALL-E (si esta habilitado en policy_params)
+    thumbnail_url: Optional[str] = None
+    thumb_enabled = await db.policy_get("thumbnail_enabled", default=True)
+    if thumb_enabled and settings.openai_api_key:
+        thumb_model = await db.policy_get("thumbnail_model", default="dall-e-3")
+        thumb_quality = await db.policy_get("thumbnail_quality", default="standard")
+        thumb_size = await db.policy_get("thumbnail_size", default="1024x1792")
+        thumb_style = await db.policy_get("thumbnail_style_suffix", default=None)
+        if not isinstance(thumb_model, str):
+            thumb_model = "dall-e-3"
+        if not isinstance(thumb_quality, str):
+            thumb_quality = "standard"
+        if not isinstance(thumb_size, str):
+            thumb_size = "1024x1792"
+        if not isinstance(thumb_style, str) or not thumb_style:
+            thumb_style = None
+
+        thumb_path = work_dir / "thumbnail.jpg"
+        try:
+            thumb_info = await generate_thumbnail(
+                script={
+                    "title": script["title"],
+                    "hook": script.get("hook", ""),
+                    "segments": script["segments"],
+                },
+                out_path=thumb_path,
+                model=thumb_model,
+                quality=thumb_quality,
+                size=thumb_size,
+                style_suffix=thumb_style,
+            )
+        except Exception as e:
+            log.warning("thumbnail_generation_failed err=%s script_id=%s",
+                        e, script_id)
+            thumb_info = None
+
+        if thumb_info and thumb_path.exists():
+            try:
+                thumb_obj = f"thumbnails/{script_id}/thumbnail.jpg"
+                thumbnail_url = storage.upload_file(thumb_path, thumb_obj)
+                await db.insert_asset(
+                    script_id=script_id, segment_index=None,
+                    asset_type="thumbnail", source=thumb_info["model"],
+                    storage_url=thumbnail_url,
+                    width=1080, height=1920,
+                    file_size_bytes=thumb_path.stat().st_size,
+                    cost_usd=thumb_info["cost_usd"],
+                    meta={
+                        "prompt": thumb_info["prompt"],
+                        "revised_prompt": thumb_info.get("revised_prompt"),
+                        "model": thumb_info["model"],
+                        "quality": thumb_info["quality"],
+                        "size": thumb_info["size"],
+                    },
+                )
+                await db.log_cost(
+                    service="openai", operation="thumbnail_generation",
+                    units=1, cost_usd=thumb_info["cost_usd"],
+                    script_id=script_id,
+                    meta={"model": thumb_info["model"],
+                          "quality": thumb_info["quality"]},
+                )
+                log.info("thumbnail_uploaded script_id=%s url=%s cost=$%.3f",
+                         script_id, thumbnail_url[:80],
+                         thumb_info["cost_usd"])
+            except Exception as e:
+                log.warning("thumbnail_upload_failed err=%s script_id=%s",
+                            e, script_id)
+                thumbnail_url = None
+    else:
+        log.info("thumbnail_skipped enabled=%s has_key=%s",
+                 thumb_enabled, bool(settings.openai_api_key))
+
     # 6. Crear short row
     short_id = await db.insert_short(
         script_id=script_id,
@@ -241,10 +516,74 @@ async def produce_short(
         duration_sec=final_duration,
         file_size_bytes=file_size,
         status="rendered",
+        thumbnail_url=thumbnail_url,
     )
 
     # 7. Marcar candidato
     await db.mark_candidate_status(candidate_id, "produced")
+
+    # 8. Quality gate: GPT-4o-mini juzga si el short merece publicarse
+    quality_info: Optional[dict] = None
+    qg_enabled = await db.policy_get("quality_gate_enabled", default=True)
+    if qg_enabled and settings.openai_api_key:
+        qg_min_score_raw = await db.policy_get("quality_gate_min_score", default=6.0)
+        try:
+            qg_min_score = float(qg_min_score_raw)
+        except (TypeError, ValueError):
+            qg_min_score = 6.0
+        qg_model = await db.policy_get("quality_gate_model", default="gpt-4o-mini")
+        if not isinstance(qg_model, str) or not qg_model:
+            qg_model = "gpt-4o-mini"
+        qg_strict = bool(await db.policy_get("quality_gate_strict", default=True))
+
+        try:
+            quality_info = await evaluate_short(
+                title=script["title"],
+                hook=script.get("hook", ""),
+                segments=script["segments"],
+                duration_sec=final_duration,
+                voice=voice,
+                tags=script.get("tags") or [],
+                model=qg_model,
+            )
+        except Exception as e:
+            log.warning("quality_gate_failed err=%s short_id=%s", e, short_id)
+            quality_info = None
+
+        if quality_info:
+            verdict = quality_info["verdict"]
+            score = quality_info["score"]
+            reasoning = quality_info["reasoning"]
+
+            # Decidir si bloqueamos la publicacion
+            should_block = (
+                qg_strict and (
+                    verdict == "reject" or score < qg_min_score
+                )
+            )
+            new_status = "low_quality" if should_block else None
+
+            await db.set_short_quality(
+                short_id, verdict, score, reasoning, new_status=new_status,
+            )
+            await db.log_cost(
+                service="openai", operation="quality_gate",
+                units=quality_info["tokens_in"] + quality_info["tokens_out"],
+                cost_usd=quality_info["cost_usd"],
+                short_id=short_id,
+                meta={"model": quality_info["model"],
+                      "verdict": verdict, "score": score,
+                      "blocked": should_block,
+                      "min_score": qg_min_score},
+            )
+            log.info(
+                "quality_gate_decision short_id=%s verdict=%s score=%.1f "
+                "blocked=%s threshold=%.1f",
+                short_id, verdict, score, should_block, qg_min_score,
+            )
+    else:
+        log.info("quality_gate_skipped enabled=%s has_key=%s",
+                 qg_enabled, bool(settings.openai_api_key))
 
     return {
         "short_id": short_id,
@@ -258,7 +597,9 @@ async def produce_short(
         "duration_sec": final_duration,
         "file_size_bytes": file_size,
         "video_url": final_url,
+        "thumbnail_url": thumbnail_url,
         "estimated_total_sec": script.get("total_estimated_sec"),
         "actual_total_sec": round(actual_total, 2),
         "segments_count": len(segments),
+        "quality": quality_info,
     }
