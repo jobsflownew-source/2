@@ -23,8 +23,8 @@ MODEL_COSTS = {
 }
 
 
-SYSTEM_PROMPT = """Eres un guionista profesional especializado en historias de terror para YouTube Shorts.
-Adaptas historias de r/nosleep al formato de video corto vertical (60s max por segmento).
+SYSTEM_PROMPT = """Eres un guionista profesional especializado en historias de terror para YouTube Shorts y TikTok.
+Adaptas historias al formato de video corto vertical (60s max por segmento) optimizando RETENCION.
 
 Reglas estrictas:
 - Devuelves SOLO JSON valido, sin explicaciones ni markdown.
@@ -33,9 +33,20 @@ Reglas estrictas:
 - NO usas comillas dramaticas, asteriscos ni emojis en el texto narrativo.
 - NO incluyes "Capitulo X" ni numeracion verbal en el texto.
 - Cada segmento debe terminar en pausa narrativa natural (punto o cliffhanger).
-- El primer segmento es un HOOK fuerte (3-8s) que enganche en los primeros 3 segundos.
 - Las keywords y el image_prompt SIEMPRE en INGLES (para APIs de imagenes).
-- El image_prompt es descriptivo, cinematografico, vertical 9:16, sin texto."""
+- El image_prompt es descriptivo, cinematografico, vertical 9:16, sin texto.
+
+REGLAS DEL HOOK VIRAL (primer segmento, los primeros 3 segundos son los mas importantes):
+- DEBE empezar con una declaracion fuerte que despierte curiosidad inmediata.
+- Usa uno de estos patrones probados (varia entre shorts):
+    a) "Mi <familiar> nunca me dijo por que <prohibicion concreta>... hasta que <verbo en pasado>."
+    b) "Pense que <suposicion comun> hasta que <evento perturbador concreto>."
+    c) "Si alguna vez <accion cotidiana>, esto es lo que NO debes hacer."
+    d) "<Numero> de <unidad de tiempo> despues, todavia no puedo explicar lo que <verbo>."
+    e) "Esto pasa cuando <accion> a las <hora especifica> en <lugar concreto>."
+- EVITA: "Hola", "Soy", "Esta es la historia de", "Era un dia normal", clickbait obvio.
+- El hook DEBE plantear una incognita que solo se resuelve viendo el resto.
+- 12-25 palabras maximo. Frases cortas. Sin adjetivos vacios."""
 
 
 USER_TEMPLATE = """Adapta esta historia a un YouTube Short narrado en {language_label}.
@@ -49,7 +60,7 @@ Devuelve EXACTAMENTE este JSON:
   "title": "string max 70 chars, atractivo, sin clickbait extremo",
   "seo_description": "string max 200 chars con #shorts #horror #nosleep al final",
   "tags": ["array max 8 tags lowercase sin #"],
-  "hook": "frase narrativa de 3-8 segundos hablados, en {language_label}",
+  "hook": "frase narrativa de 3-8 segundos hablados, en {language_label}, siguiendo las REGLAS DEL HOOK VIRAL del system prompt",
   "segments": [
     {{
       "id": 1,
@@ -64,7 +75,9 @@ Devuelve EXACTAMENTE este JSON:
 
 Reglas adicionales:
 - Genera entre 3 y 5 segmentos. Total entre 120 y 240 segundos.
-- El primer segmento ES el hook expandido a narracion.
+- El primer segmento ES el hook viral expandido a narracion (NO repitas el hook palabra por palabra; el primer segmento de 'segments' debe COMENZAR con el hook y luego desarrollarlo durante 35-55 segundos).
+- El SEGUNDO segmento debe terminar con un mini-cliffhanger ("y entonces vi que...", "lo que no esperaba era...") para reforzar retencion en 30-60s.
+- El UNTERMOST segmento (el ultimo) cierra con un giro o pregunta abierta que genere comentarios.
 - Calcula estimated_duration_sec asumiendo {wpm} palabras por minuto.{attribution_rule}
 - Si la historia es inadaptable (muy confusa, sin trama, demasiado corta), devuelve {{"reject": true, "reason": "..."}} en lugar del JSON normal."""
 

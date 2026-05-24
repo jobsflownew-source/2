@@ -1,17 +1,18 @@
-"""Video composition with MoviePy + FFmpeg.
+"""Video composition with FFmpeg.
 
 Genera un Short 9:16 (1080x1920) a partir de:
-- Lista de segmentos con (image_path, audio_path, text, duration_sec)
+- Lista de segmentos con (image_path, audio_path, text, duration_sec, mood)
 - Aplica Ken Burns (zoom suave) a cada imagen
+- Crossfade entre clips (configurable)
 - Mezcla audio narracion + (opcional) musica de fondo
-- Subtitulos quemados con FFmpeg (ASS)
+- Subtitulos quemados con FFmpeg (ASS) con colores por mood
 """
 from __future__ import annotations
 
 import math
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -21,12 +22,39 @@ W, H = 1080, 1920
 FPS = 30
 
 
+# Colores por mood en formato ASS (&HBBGGRR). Estos son fallbacks si la
+# config de policy_params no llega. Editable via policy_params.subtitle_colors_by_mood.
+DEFAULT_MOOD_COLORS = {
+    "tension":   "&H003C3CFF",   # crimson
+    "fear":      "&H001515FF",   # rojo intenso
+    "despair":   "&HFFC080",     # azul oscuro
+    "reveal":    "&HFFFFFF",     # blanco brillante
+    "aftermath": "&HD0D0A0",     # gris azulado
+    "default":   "&HFFFFFF",
+}
+
+
 @dataclass
 class Segment:
     image_path: Path
     audio_path: Path
     text: str
     duration_sec: float
+    mood: str = "default"
+
+
+@dataclass
+class RenderConfig:
+    """Configuracion de render que el pipeline lee de policy_params.
+
+    Permite encender/apagar features en caliente via SQL sin redeploy.
+    """
+    burn_subtitles: bool = True
+    transitions_enabled: bool = True
+    transition_sec: float = 0.4
+    music_volume: float = 0.15
+    subtitle_font: str = "Liberation Sans Bold"
+    mood_colors: dict = field(default_factory=lambda: dict(DEFAULT_MOOD_COLORS))
 
 
 def _fit_to_vertical(src: Path, dst: Path) -> Path:
@@ -63,10 +91,8 @@ def _ken_burns_clip(image_path: Path, duration: float, out_path: Path,
                     zoom_start: float = 1.0, zoom_end: float = 1.12) -> Path:
     """Genera un clip MP4 con efecto Ken Burns usando FFmpeg zoompan."""
     frames = max(int(duration * FPS), 1)
-    # zoompan necesita zoom entero/lineal; usamos expresion frame-based
     z_per_frame = (zoom_end - zoom_start) / frames
     zoom_expr = f"min(zoom+{z_per_frame:.6f},{zoom_end:.4f})"
-    # Pequeno pan horizontal aleatorio segun hash del nombre
     pan_dir = 1 if hash(str(image_path)) % 2 == 0 else -1
     x_expr = f"iw/2-(iw/zoom/2)+{pan_dir}*on*0.3"
     y_expr = "ih/2-(ih/zoom/2)"
@@ -87,15 +113,14 @@ def _ken_burns_clip(image_path: Path, duration: float, out_path: Path,
     return out_path
 
 
-def _concat_clips(clips: list[Path], out_path: Path) -> Path:
-    """Concatena clips MP4 con xfade ligero."""
+def _concat_clips_simple(clips: list[Path], out_path: Path) -> Path:
+    """Concatena clips MP4 sin transiciones (fallback rapido)."""
     if len(clips) == 1:
         cmd = ["ffmpeg", "-y", "-i", str(clips[0]),
                "-c", "copy", str(out_path)]
         subprocess.run(cmd, check=True, capture_output=True)
         return out_path
 
-    # concat demuxer: rapido, sin re-encode
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
         for c in clips:
             f.write(f"file '{c.absolute()}'\n")
@@ -105,6 +130,56 @@ def _concat_clips(clips: list[Path], out_path: Path) -> Path:
            "-i", list_file, "-c", "copy", str(out_path)]
     subprocess.run(cmd, check=True, capture_output=True)
     Path(list_file).unlink(missing_ok=True)
+    return out_path
+
+
+def _concat_clips_xfade(clips: list[Path], durations: list[float],
+                         out_path: Path, transition_sec: float = 0.4) -> Path:
+    """Concatena clips MP4 con crossfade entre cada par.
+
+    Usa xfade encadenados con offsets calculados. Re-encodifica.
+    Si solo hay 1 clip o transition_sec <= 0, hace fallback al simple.
+    """
+    if len(clips) <= 1 or transition_sec <= 0:
+        return _concat_clips_simple(clips, out_path)
+
+    # Sanity: la transicion no puede ser mas larga que el clip
+    transition_sec = min(transition_sec, min(durations) * 0.5, 0.8)
+    if transition_sec < 0.1:
+        return _concat_clips_simple(clips, out_path)
+
+    inputs: list[str] = []
+    for c in clips:
+        inputs.extend(["-i", str(c)])
+
+    # Construir filter_complex con xfade encadenado
+    # Inputs: [0:v] [1:v] [2:v] ...
+    # Cada xfade necesita offset = duracion_acumulada - transition_sec
+    filter_parts: list[str] = []
+    cumulative = durations[0]
+    prev_label = "[0:v]"
+    for i in range(1, len(clips)):
+        offset = max(cumulative - transition_sec, 0.0)
+        out_label = f"[v{i}]"
+        filter_parts.append(
+            f"{prev_label}[{i}:v]xfade=transition=fade:"
+            f"duration={transition_sec:.3f}:offset={offset:.3f}{out_label}"
+        )
+        cumulative += durations[i] - transition_sec
+        prev_label = out_label
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", prev_label,
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        "-r", str(FPS),
+        str(out_path),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
     return out_path
 
 
@@ -121,8 +196,36 @@ def _concat_audios(audios: list[Path], out_path: Path) -> Path:
     return out_path
 
 
-def _build_ass_subtitles(segments: list[Segment], out_path: Path) -> Path:
-    """SRT/ASS simple, una linea grande por segmento, posicion media-baja."""
+def _build_ass_subtitles(segments: list[Segment], out_path: Path,
+                         config: Optional[RenderConfig] = None) -> Path:
+    """Genera subtitulos ASS con color dinamico por mood y fuente configurable.
+
+    Cada segmento usa su propio Style con el color del mood. Si dos segmentos
+    consecutivos tienen el mismo mood, comparten estilo (eficiencia).
+    """
+    cfg = config or RenderConfig()
+    font = cfg.subtitle_font or "Liberation Sans Bold"
+
+    # Genera Styles unicos por mood usado
+    used_moods: list[str] = []
+    for seg in segments:
+        m = (seg.mood or "default").lower()
+        if m not in cfg.mood_colors:
+            m = "default"
+        if m not in used_moods:
+            used_moods.append(m)
+
+    style_lines = []
+    for m in used_moods:
+        color = cfg.mood_colors.get(m) or cfg.mood_colors.get("default", "&HFFFFFF")
+        # ASS Style: Name, Fontname, Fontsize, PrimaryColour, OutlineColour,
+        # BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment,
+        # MarginL, MarginR, MarginV, Encoding
+        style_lines.append(
+            f"Style: mood_{m},{font},78,{color},&H00000000,"
+            f"&H80000000,1,0,1,5,2,2,80,80,300,1"
+        )
+
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -132,8 +235,7 @@ def _build_ass_subtitles(segments: list[Segment], out_path: Path) -> Path:
         "Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, "
         "BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,DejaVu Sans,68,&H00FFFFFF,&H00000000,"
-        "&H80000000,1,0,1,4,2,2,80,80,260,1\n\n"
+        + "\n".join(style_lines) + "\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, "
         "MarginV, Effect, Text\n"
@@ -148,7 +250,9 @@ def _build_ass_subtitles(segments: list[Segment], out_path: Path) -> Path:
     lines = []
     cursor = 0.0
     for seg in segments:
-        # Texto en chunks de ~6 palabras para legibilidad en mobile
+        mood = (seg.mood or "default").lower()
+        if mood not in cfg.mood_colors:
+            mood = "default"
         words = seg.text.split()
         if not words:
             cursor += seg.duration_sec
@@ -159,10 +263,12 @@ def _build_ass_subtitles(segments: list[Segment], out_path: Path) -> Path:
         per_chunk = seg.duration_sec / len(chunks)
         for c in chunks:
             txt = " ".join(c).replace("\n", " ")
+            # Pequena animacion de pop-in (fade 200ms al entrar)
+            txt = "{\\fad(200,0)}" + txt
             start = cursor
             end = cursor + per_chunk
             lines.append(
-                f"Dialogue: 0,{fmt(start)},{fmt(end)},Default,,0,0,0,,{txt}"
+                f"Dialogue: 0,{fmt(start)},{fmt(end)},mood_{mood},,0,0,0,,{txt}"
             )
             cursor = end
 
@@ -176,8 +282,17 @@ def render_short(
     output_path: Path,
     music_path: Optional[Path] = None,
     burn_subtitles: bool = True,
+    config: Optional[RenderConfig] = None,
 ) -> Path:
-    """Renderiza un Short 9:16 listo para subir a YouTube."""
+    """Renderiza un Short 9:16 listo para subir a YouTube.
+
+    Args:
+        config: parametros opcionales de render (transiciones, fuente,
+            colores por mood, volumen musica). Si None, usa defaults.
+    """
+    cfg = config or RenderConfig(burn_subtitles=burn_subtitles)
+    if config is None:
+        cfg.burn_subtitles = burn_subtitles
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Normalizar imagenes a 9:16
@@ -189,27 +304,36 @@ def render_short(
 
     # 2. Generar clips Ken Burns
     clips: list[Path] = []
+    durations: list[float] = []
     for i, (img, seg) in enumerate(zip(norm_images, segments)):
         clip = work_dir / f"clip_{i:02d}.mp4"
         _ken_burns_clip(img, seg.duration_sec, clip)
         clips.append(clip)
+        durations.append(seg.duration_sec)
 
-    # 3. Concatenar video y audio por separado
+    # 3. Concatenar video con o sin xfade segun config
     video_only = work_dir / "video_only.mp4"
-    _concat_clips(clips, video_only)
+    if cfg.transitions_enabled and len(clips) > 1:
+        _concat_clips_xfade(clips, durations, video_only,
+                            transition_sec=cfg.transition_sec)
+    else:
+        _concat_clips_simple(clips, video_only)
 
+    # 4. Concatenar narracion
     audio_concat = work_dir / "narration.m4a"
     _concat_audios([s.audio_path for s in segments], audio_concat)
 
-    # 4. Mezclar audio (con musica opcional)
+    # 5. Mezclar audio (con musica opcional)
     if music_path and music_path.exists():
         mixed = work_dir / "audio_mix.m4a"
+        vol = max(0.0, min(cfg.music_volume, 1.0))
         cmd = [
             "ffmpeg", "-y",
             "-i", str(audio_concat),
             "-stream_loop", "-1", "-i", str(music_path),
             "-filter_complex",
-            "[1:a]volume=0.18[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]",
+            f"[1:a]volume={vol:.3f}[bg];"
+            f"[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[a]",
             "-map", "[a]", "-c:a", "aac", "-b:a", "192k", str(mixed),
         ]
         subprocess.run(cmd, check=True, capture_output=True)
@@ -217,7 +341,7 @@ def render_short(
     else:
         final_audio = audio_concat
 
-    # 5. Combinar video + audio + (opcional) subtitulos
+    # 6. Combinar video + audio
     pre_sub = work_dir / "pre_sub.mp4"
     cmd = [
         "ffmpeg", "-y", "-i", str(video_only), "-i", str(final_audio),
@@ -225,10 +349,11 @@ def render_short(
     ]
     subprocess.run(cmd, check=True, capture_output=True)
 
+    # 7. Subtitulos quemados con colores por mood
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if burn_subtitles:
+    if cfg.burn_subtitles:
         ass_path = work_dir / "subs.ass"
-        _build_ass_subtitles(segments, ass_path)
+        _build_ass_subtitles(segments, ass_path, config=cfg)
         cmd = [
             "ffmpeg", "-y", "-i", str(pre_sub),
             "-vf", f"ass={ass_path}",
@@ -240,7 +365,6 @@ def render_short(
         ]
         subprocess.run(cmd, check=True, capture_output=True)
     else:
-        # solo re-mux con faststart
         cmd = [
             "ffmpeg", "-y", "-i", str(pre_sub),
             "-c", "copy", "-movflags", "+faststart", str(output_path),
