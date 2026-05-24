@@ -21,7 +21,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.story_candidates\n  WHERE source = 'ai_generated'\n    AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\ntarget AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='stories_per_day'\n),\nlang AS (\n  SELECT trim(both '\"' from value::text) AS l FROM app.policy_params WHERE key='default_language'\n)\nSELECT\n  GREATEST(COALESCE((SELECT m FROM target), 5) - (SELECT n FROM today_count), 0) AS to_generate,\n  COALESCE((SELECT l FROM lang), 'es') AS language,\n  (SELECT n FROM today_count) AS generated_today,\n  COALESCE((SELECT m FROM target), 5) AS target_per_day;"
+        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.story_candidates\n  WHERE source = 'ai_generated'\n    AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\ntarget AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='stories_per_day'\n),\nlang AS (\n  SELECT trim(both '\"' from value::text) AS l FROM app.policy_params WHERE key='default_language'\n)\nSELECT\n  GREATEST(COALESCE((SELECT m FROM target), 10) - (SELECT n FROM today_count), 0) AS to_generate,\n  COALESCE((SELECT l FROM lang), 'es') AS language,\n  (SELECT n FROM today_count) AS generated_today,\n  COALESCE((SELECT m FROM target), 10) AS target_per_day;"
       },
       "id": "check-quota",
       "name": "Check daily quota",
@@ -40,7 +40,7 @@
         "conditions": {
           "options": {
             "caseSensitive": true,
-            "typeValidation": "strict"
+            "typeValidation": "loose"
           },
           "conditions": [
             {
@@ -64,6 +64,7 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "http://render-service:8000/stories/generate",
         "sendHeaders": true,
         "headerParameters": {
@@ -73,7 +74,7 @@
           ]
         },
         "sendBody": true,
-        "contentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"count\": {{ $json.to_generate }},\n  \"language\": \"{{ $json.language }}\",\n  \"auto_queue\": true\n}",
         "options": {
           "timeout": 600000,
@@ -92,9 +93,10 @@
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 historias IA generadas\",\n    \"description\": \"**Creadas:** {{ $json.created }}/{{ $json.requested }}\\n**Coste total:** ${{ $json.total_cost_usd }}\",\n    \"fields\": [\n      {\"name\": \"Errores\", \"value\": \"{{ ($json.errors || []).length }}\", \"inline\": true}\n    ],\n    \"color\": 5814783\n  }]\n}",
         "options": {}
       },
@@ -102,13 +104,16 @@
       "name": "Discord OK",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1120, 200]
+      "position": [1120, 200],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
     },
     {
       "parameters": {
+        "method": "POST",
         "url": "={{ $env.DISCORD_WEBHOOK_URL }}",
         "sendBody": true,
-        "bodyContentType": "json",
+        "specifyBody": "json",
         "jsonBody": "={\n  \"content\": null,\n  \"embeds\": [{\n    \"title\": \"WF1 cuota diaria alcanzada\",\n    \"description\": \"Generadas hoy: **{{ $json.generated_today }}/{{ $json.target_per_day }}**\",\n    \"color\": 16776960\n  }]\n}",
         "options": {}
       },
@@ -116,7 +121,9 @@
       "name": "Discord skip",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [900, 400]
+      "position": [900, 400],
+      "onError": "continueRegularOutput",
+      "continueOnFail": true
     }
   ],
   "connections": {

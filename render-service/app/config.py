@@ -39,5 +39,25 @@ class Settings(BaseSettings):
     database_url: str = ""
     redis_url: str = "redis://redis:6379/0"
 
+    # YouTube Data API v3
+    youtube_client_id: str = ""
+    youtube_client_secret: str = ""
+    youtube_refresh_token: str = ""
+    youtube_channel_id: str = ""        # opcional, para verificacion
+    youtube_default_privacy: str = "public"   # public | unlisted | private
+    youtube_default_category_id: str = "24"   # 24 = Entertainment
+
+    # TikTok Content Posting API
+    # Setup: ver scripts/tiktok_oauth.py
+    tiktok_client_key: str = ""
+    tiktok_client_secret: str = ""
+    tiktok_refresh_token: str = ""
+    tiktok_open_id: str = ""             # opcional, para verificacion
+    # 'inbox' (Direct Inbox, sin audit) | 'direct' (Direct Post, requiere audit)
+    tiktok_publish_mode: str = "inbox"
+    # Para Direct Post: PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS |
+    # FOLLOWER_OF_CREATOR | SELF_ONLY
+    tiktok_privacy_level: str = "SELF_ONLY"
+
 
 settings = Settings()

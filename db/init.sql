@@ -221,10 +221,18 @@ CREATE TABLE IF NOT EXISTS policy_params (
 
 -- Seeds iniciales
 INSERT INTO policy_params (key, value) VALUES
-    ('voices', '["es-ES-AlvaroNeural","es-ES-ElviraNeural","es-MX-JorgeNeural"]'::jsonb),
+    ('voices', '[
+        "es-ES-AlvaroNeural",
+        "es-ES-TristanMultilingualNeural",
+        "es-ES-IsidoraMultilingualNeural",
+        "es-ES-XimenaNeural",
+        "es-MX-JorgeNeural",
+        "es-CO-GonzaloNeural"
+    ]'::jsonb),
     ('image_styles', '["found_footage","cinematic_horror","polaroid_80s","gothic_painting"]'::jsonb),
     ('publish_hours_utc', '[14,18,21]'::jsonb),
     ('max_shorts_per_day', '5'::jsonb),
+    ('max_uploads_per_day', '5'::jsonb),
     ('stories_per_day', '5'::jsonb),
     ('default_language', '"es"'::jsonb),
     ('hook_templates', '["Esto le paso a...","Nunca crei en... hasta que","Si ves esto, no..."]'::jsonb),
