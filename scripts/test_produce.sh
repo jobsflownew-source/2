@@ -16,7 +16,7 @@ echo "1) Buscando un candidato queued..."
 QUEUE=$(curl -sf "$API/produce/queue?limit=1" -H "X-API-Key: $KEY")
 echo "$QUEUE" | jq .
 
-CID=$(echo "$QUEUE" | jq -r '.[0].candidate_id // empty')
+CID=$(echo "$QUEUE" | jq -r '.[0].id // .[0].candidate_id // empty')
 
 if [ -z "$CID" ]; then
   echo ""
