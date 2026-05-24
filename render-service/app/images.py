@@ -108,6 +108,27 @@ async def search_pexels(query: str, per_page: int = DEFAULT_POOL_SIZE,
     ]
 
 
+def _is_portrait(r: dict) -> bool:
+    h = r.get("height") or 0
+    w = r.get("width") or 0
+    return h > w
+
+
+def _url_of(r: dict) -> str:
+    return r.get("download") or r.get("url") or ""
+
+
+def _filter_fresh(results: list[dict],
+                  excluded_urls: Optional[set[str]]) -> list[dict]:
+    """Devuelve solo las candidatas portrait y no excluidas."""
+    if not results:
+        return []
+    excluded = excluded_urls or set()
+    fresh = [r for r in results if _url_of(r) and _url_of(r) not in excluded]
+    portrait_fresh = [r for r in fresh if _is_portrait(r)]
+    return portrait_fresh if portrait_fresh else fresh
+
+
 def _filter_and_pick(results: list[dict],
                      excluded_urls: Optional[set[str]]) -> Optional[dict]:
     """Filtra portrait + excluidas y elige una al azar.
@@ -117,28 +138,10 @@ def _filter_and_pick(results: list[dict],
       2. cualquiera NO excluida (eleccion aleatoria)
       3. None
     """
-    if not results:
+    fresh = _filter_fresh(results, excluded_urls)
+    if not fresh:
         return None
-
-    def is_portrait(r: dict) -> bool:
-        h = r.get("height") or 0
-        w = r.get("width") or 0
-        return h > w
-
-    def url_of(r: dict) -> str:
-        return r.get("download") or r.get("url") or ""
-
-    excluded = excluded_urls or set()
-    fresh = [r for r in results if url_of(r) and url_of(r) not in excluded]
-
-    portrait_fresh = [r for r in fresh if is_portrait(r)]
-    if portrait_fresh:
-        return random.choice(portrait_fresh)
-    if fresh:
-        return random.choice(fresh)
-    # Todo el pool ya fue usado: caemos a usar la menos viral (la primera)
-    # mejor que reventar el render. Esto es muy raro con per_page=20.
-    return None
+    return random.choice(fresh)
 
 
 async def find_best_image(
@@ -176,6 +179,62 @@ async def find_best_image(
         except Exception:
             continue
     return None
+
+
+async def find_image_candidates(
+    keywords: list[str],
+    excluded_urls: Optional[Iterable[str]] = None,
+    pool_size: int = DEFAULT_POOL_SIZE,
+    top_k: int = 6,
+) -> list[dict]:
+    """Devuelve hasta top_k candidatas para que un selector externo elija.
+
+    Se usa cuando hay AI-scoring activo (image_ai_selection=true en
+    policy_params): pedimos varias y dejamos que GPT-4o-mini-vision
+    decida cual encaja mejor con el segmento.
+
+    Estrategia:
+      - Para cada provider (Pixabay -> Unsplash -> Pexels), pide pool_size
+        resultados con paginacion aleatoria.
+      - Filtra excluded_urls y prefiere portrait.
+      - Acumula entre providers hasta llegar a top_k.
+      - Aleatoriza el orden final para no sesgar siempre al mismo provider.
+    """
+    if not keywords:
+        return []
+    excluded_set = set(excluded_urls) if excluded_urls else set()
+    query = " ".join(keywords[:3])
+
+    accumulated: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for fn in (search_pixabay, search_unsplash, search_pexels):
+        if len(accumulated) >= top_k:
+            break
+        try:
+            page = random.randint(1, 3)
+            results = await fn(query, per_page=pool_size, page=page)
+            if not results and page > 1:
+                results = await fn(query, per_page=pool_size, page=1)
+            for r in _filter_fresh(results, excluded_set):
+                u = _url_of(r)
+                if u in seen_urls:
+                    continue
+                seen_urls.add(u)
+                # Anotamos la query usada para que el selector tenga contexto
+                r = dict(r)
+                r["keywords_query"] = query
+                accumulated.append(r)
+                if len(accumulated) >= top_k * 2:
+                    break
+        except Exception:
+            continue
+
+    if not accumulated:
+        return []
+
+    random.shuffle(accumulated)
+    return accumulated[:top_k]
 
 
 async def download_image(image: dict, dest: Path) -> Path:
