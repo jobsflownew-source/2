@@ -21,7 +21,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.story_candidates\n  WHERE source = 'ai_generated'\n    AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\ntarget AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='stories_per_day'\n),\nlang AS (\n  SELECT trim(both '\"' from value::text) AS l FROM app.policy_params WHERE key='default_language'\n)\nSELECT\n  GREATEST(COALESCE((SELECT m FROM target), 5) - (SELECT n FROM today_count), 0) AS to_generate,\n  COALESCE((SELECT l FROM lang), 'es') AS language,\n  (SELECT n FROM today_count) AS generated_today,\n  COALESCE((SELECT m FROM target), 5) AS target_per_day;"
+        "query": "WITH today_count AS (\n  SELECT COUNT(*) AS n\n  FROM app.story_candidates\n  WHERE source = 'ai_generated'\n    AND fetched_at >= DATE_TRUNC('day', now() AT TIME ZONE 'UTC')\n),\ntarget AS (\n  SELECT (value::text)::int AS m FROM app.policy_params WHERE key='stories_per_day'\n),\nlang AS (\n  SELECT trim(both '\"' from value::text) AS l FROM app.policy_params WHERE key='default_language'\n)\nSELECT\n  GREATEST(COALESCE((SELECT m FROM target), 10) - (SELECT n FROM today_count), 0) AS to_generate,\n  COALESCE((SELECT l FROM lang), 'es') AS language,\n  (SELECT n FROM today_count) AS generated_today,\n  COALESCE((SELECT m FROM target), 10) AS target_per_day;"
       },
       "id": "check-quota",
       "name": "Check daily quota",
