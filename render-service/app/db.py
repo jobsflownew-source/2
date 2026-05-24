@@ -378,3 +378,50 @@ async def record_voice_use(voice_id: str) -> None:
         " DO UPDATE SET pulls = bandit_arms.pulls + 1, last_used = now()",
         (voice_id,),
     )
+
+
+# ------------------ Image deduplication ------------------
+async def get_recent_image_urls(days: Optional[int] = None) -> set[str]:
+    """Devuelve el set de URLs de imagenes ya usadas en los ultimos N dias.
+
+    Si days es None, lee 'image_cooldown_days' de policy_params (default 30).
+    Se usa para excluir candidatas en find_best_image y evitar reutilizar
+    las mismas imagenes en shorts diferentes.
+    """
+    if days is None:
+        cooldown = await policy_get("image_cooldown_days", default=30)
+        try:
+            days = int(cooldown)
+        except (TypeError, ValueError):
+            days = 30
+
+    rows = await aexec(
+        "SELECT image_url FROM used_images"
+        " WHERE last_used_at >= now() - make_interval(days => %s)",
+        (days,), fetch="all",
+    ) or []
+    return {r["image_url"] for r in rows if r.get("image_url")}
+
+
+async def record_image_used(
+    image_url: str, source: str,
+    script_id: Optional[int] = None,
+    segment_index: Optional[int] = None,
+) -> None:
+    """Registra que una URL de imagen externa fue usada.
+
+    Si ya existia, incrementa times_used y actualiza last_used_at.
+    Si es nueva, la inserta. Idempotente.
+    """
+    if not image_url:
+        return
+    await aexec(
+        "INSERT INTO used_images"
+        "  (image_url, source, first_used_at, last_used_at, times_used,"
+        "   first_script_id, first_segment)"
+        " VALUES (%s, %s, now(), now(), 1, %s, %s)"
+        " ON CONFLICT (image_url) DO UPDATE"
+        "   SET times_used = used_images.times_used + 1,"
+        "       last_used_at = now()",
+        (image_url, source, script_id, segment_index),
+    )
