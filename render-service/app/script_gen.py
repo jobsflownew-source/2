@@ -190,8 +190,9 @@ def _validate_script(parsed: dict, language: str) -> tuple[bool, str | None]:
         if seg["estimated_duration_sec"] > 65:
             return False, f"segment_{i}_too_long"
     parsed["total_estimated_sec"] = round(total, 1)
-    if total > 280:  # margen sobre 60s*4
-        return False, "total_too_long"
+    # total_too_long check DISABLED - YouTube acepta hasta 3 min como Short
+    # si es vertical 9:16. El prompt ya pide 45-58s pero si GPT se pasa
+    # un poco, no rechazamos el short.
     return True, None
 
 
