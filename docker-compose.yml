@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -75,6 +73,11 @@ services:
     image: n8nio/n8n:latest
     container_name: horror_n8n
     restart: unless-stopped
+    # DNS explicito (mismo motivo que render-service: WSL2 + Docker
+    # a veces fallan resolviendo api.n8n.io / hooks externos).
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "${N8N_PORT}:5678"
     environment:
@@ -117,6 +120,12 @@ services:
       dockerfile: Dockerfile
     container_name: horror_render
     restart: unless-stopped
+    # DNS explicito para que el contenedor pueda resolver oauth2.googleapis.com,
+    # api.openai.com, pixabay.com, etc. WSL2 a veces hereda DNS roto del host
+    # y los reintentos de OAuth dan "Read timed out".
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "${RENDER_PORT}:8000"
     environment:
